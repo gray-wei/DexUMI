@@ -1,0 +1,64 @@
+# Configuration for HTTP-based evaluation
+
+# Control mode: "http" or "zmq"
+control_mode: "http"
+
+# HTTP server configuration
+http_server:
+  url: "http://127.0.0.1:5000"
+  timeout: 1.0
+
+# Robot control parameters
+robot:
+  max_pos_speed: 0.1  # Maximum position speed (m/s)
+  max_rot_speed: 0.6  # Maximum rotation speed (rad/s)
+  frequency: 10       # Control frequency (Hz)
+  
+  # Action latencies (seconds)
+  robot_action_latency: 0.170
+  hand_action_latency: 0.300
+  camera_latency: 0.185
+  
+  # Execution parameters
+  exec_horizon: 8  # Number of action steps to execute
+
+# Hand configuration
+hand:
+  type: "xhand"  # "xhand" or "inspire"
+  initial_position:
+    - 0.92755819
+    - 0.52026953
+    - 0.22831853
+    - 0.0707963
+    - 1.1
+    - 0.15707963
+    - 0.95
+    - 0.12217305
+    - 1.0392188
+    - 0.03490659
+    - 1.0078164
+    - 0.17453293
+
+# Force sensor configuration
+fsr:
+  enabled: false
+  binary_cutoff: [10, 10, 10]
+  obs_horizon: 1
+
+# Camera configuration
+camera:
+  enable_record_camera: false
+  video_record_path: "video_record"
+  record_fps: 45
+  stream_fps: 60
+
+# Model configuration
+model:
+  path: null  # Set to model path, e.g., "/path/to/model"
+  checkpoint: 600
+
+# Hand-eye calibration matrix
+calibration:
+  x_offset: -0.0395
+  y_offset: -0.1342
+  z_offset: 0.0428
