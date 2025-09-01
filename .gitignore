@@ -180,3 +180,8 @@ experiment/
 real_policy_eval/
 xhand_control_python/
 notebook/
+
+# 
+data/
+data_analysis/
+trash/
