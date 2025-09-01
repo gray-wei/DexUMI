@@ -1,25 +1,17 @@
 import copy
 import datetime
 import os
-
-os.environ["NCCL_DEBUG"] = "INFO"
-os.environ["NCCL_P2P_DISABLE"] = "1"
 import pickle
 
 import hydra
 import numpy as np
 import torch
-import torch.distributed as dist
 import wandb
 from accelerate import Accelerator
 from dexumi.common.utility.model import load_config
 from diffusers.optimization import get_scheduler
 from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig, OmegaConf
-
-dist.init_process_group(
-    backend="nccl", init_method="env://", timeout=datetime.timedelta(seconds=5400)
-)
 
 
 @hydra.main(
@@ -103,19 +95,25 @@ def train_diffusion_policy(cfg: DictConfig):
         num_training_steps=max_train_steps * accelerator.num_processes,
     )
     # Prepare everything with our `accelerator`.
+    print("Preparing model, optimizer, dataloader, lr_scheduler...")
     model, optimizer, dataloader, lr_scheduler = accelerator.prepare(
         model, optimizer, dataloader, lr_scheduler
     )
+    print("✓ Accelerator preparation completed")
     if resume:
         model_state = os.path.join(model_path, "state", f"epoch_{model_ckpt}")
         accelerator.load_state(model_state)
         print("successfully loaded model from checkpoint!")
 
     if cfg.training.use_ema:
+        print("Creating EMA model...")
         ema_model = copy.deepcopy(accelerator.unwrap_model(model))
         ema = hydra.utils.instantiate(cfg.ema, model=ema_model)
+        print("✓ EMA model created")
 
+    print("🚀 Starting training loop...")
     for epoch in range(cfg.training.epochs):
+        print(f"Epoch {epoch}/{cfg.training.epochs}")
         epoch_loss = []
 
         # batch loop

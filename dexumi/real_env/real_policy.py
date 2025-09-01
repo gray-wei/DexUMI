@@ -74,17 +74,23 @@ class RealPolicy:
         # visual_obs: NxHxWxC
         _, H, W, _ = visual_obs.shape
         B = 1
-        if proprioception is not None:
+        if proprioception is not None and "proprioception" in self.stats:
             proprioception = normalize_data(
                 proprioception.reshape(1, -1), self.stats["proprioception"]
             )  # (1,N)
             proprioception = (
                 torch.from_numpy(proprioception).unsqueeze(0).cuda()
             )  # (B,1,6)
+        elif proprioception is not None:
+            print("Warning: proprioception data provided but no stats available, setting to None")
+            proprioception = None
 
-        if fsr is not None:
+        if fsr is not None and "fsr" in self.stats:
             fsr = normalize_data(fsr.reshape(1, -1), self.stats["fsr"])
             fsr = torch.from_numpy(fsr).unsqueeze(0).cuda()  # (B,1,2)
+        elif fsr is not None:
+            print("Warning: fsr data provided but no stats available, setting to None")
+            fsr = None
 
         visual_obs = np.array(
             [

@@ -12,7 +12,7 @@ debug: False
 action_dim: 18
 
 ema:
-  _target_: exoskeleton.common.ema_model.EMAModel
+  _target_: dexumi.common.ema_model.EMAModel
   update_after_step: 0
   inv_gamma: 1.0
   power: 0.75
@@ -20,10 +20,10 @@ ema:
   max_value: 0.9999
 
 training:
-  epochs: 10000
-  gradient_accumulation_steps: 1
-  batch_size: 300
-  num_workers: 4
+  epochs: 1000
+  gradient_accumulation_steps: 4
+  batch_size: 48
+  num_workers: 8
   shuffle: True
   pin_memory: False
   persistent_workers: True
@@ -55,9 +55,9 @@ lr_scheduler: "cosine"
 num_warmup_steps: 500
 
 dataset:
-  _target_: exoskeleton.diffusion_policy.dataloader.dexumi_dataset.DexUMIDataset
+  _target_: dexumi.diffusion_policy.dataloader.dexumi_dataset.DexUMIDataset
   data_dirs: [
-    "path/to/dataset",
+    "/home/ubuntu/hgw/IL/DexUMI/data/xhand_dataset_aligned.zarr",
   ]
   load_camera_ids: [0]
   camera_resize_shape: [240,240]
@@ -67,8 +67,8 @@ dataset:
   unnormal_list: ["camera_0","pose"]
   optional_transforms: ["Resize","RandomCrop","ColorJitter","RandomGrayscale","GaussianBlur"]
   relative_hand_action: False
-  skip_proprioception: True
-  enable_fsr: False
+  skip_proprioception: False
+  enable_fsr: True
   bgr2rgb: True
   max_episode: null
   fsr_binary_cutoff: [10,10,10] #xhand 
@@ -76,11 +76,11 @@ dataset:
 
 
 model:
-  _target_: exoskeleton.diffusion_policy.diffusion_policy.DiffusionPolicy
+  _target_: dexumi.diffusion_policy.diffusion_policy.DiffusionPolicy
   vision_backbone_kwargs: 
     model_name: "vit_small_patch8_224.dino"
   freeze_vision_back: False
   diffusion_policy_head:
-    _target_: exoskeleton.diffusion_policy.model.diffusion_model.ConditionalUnet1D
+    _target_: dexumi.diffusion_policy.model.diffusion_model.ConditionalUnet1D
     input_dim: ${action_dim}
-    global_cond_dim: 384
+    global_cond_dim: 401

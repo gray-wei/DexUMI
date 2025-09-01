@@ -78,13 +78,17 @@ class DiffusionPolicy(nn.Module):
             visual_embedding, "(b o) d -> b (o d)", b=bsz, o=obs_horizon
         )
         condition = [visual_embedding]
+        print(f"    visual_embedding shape: {visual_embedding.shape}")
         if proprioception is not None:
             proprioception = rearrange(proprioception, "b o c -> b (o c)")
             condition.append(proprioception)
+            print(f"    proprioception shape: {proprioception.shape}")
         if fsr is not None:
             fsr = rearrange(fsr, "b o c -> b (o c)")
             condition.append(fsr)
+            print(f"    fsr shape: {fsr.shape}")
 
         condition = torch.cat(condition, dim=1)
+        print(f"    Final condition shape: {condition.shape}")
         trajectory = self.condition_sample(condition, trajectory, noise_scheduler)
         return trajectory
