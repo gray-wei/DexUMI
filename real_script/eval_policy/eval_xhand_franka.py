@@ -1,4 +1,3 @@
-import os
 import time
 from collections import deque
 
@@ -7,22 +6,16 @@ import cv2
 import numpy as np
 import scipy.spatial.transform as st
 
-from dexumi.camera.camera import FrameData
 from dexumi.camera.realsense_camera import RealSenseCamera, get_all_realsense_cameras
 from dexumi.common.frame_manager import FrameRateContext
 from dexumi.common.utility.matrix import (
     homogeneous_matrix_to_6dof,
     vec6dof_to_homogeneous_matrix,
 )
-from dexumi.common.utility.video import (
-    extract_frames_videos,
-)
 from dexumi.constants import (
     XHAND_HAND_MOTOR_SCALE_FACTOR,
 )
-from dexumi.data_recording import VideoRecorder
 from dexumi.data_recording.data_buffer import PoseInterpolator
-from dexumi.data_recording.record_manager import RecorderManager
 
 # Import HTTP control classes
 from dexumi.real_env.common.http_client import HTTPRobotClient, HTTPHandClient
@@ -79,9 +72,6 @@ initial_hand_pos = np.array([
 @click.command()
 @click.option("-f", "--frequency", type=float, default=10, help="Control frequency (Hz)")
 @click.option(
-    "-rc", "--enable_record_camera", is_flag=True, help="Enable record camera"
-)
-@click.option(
     "-ct", "--camera_type", type=click.Choice(['realsense', 'oak']), default="realsense", 
     help="Camera type to use"
 )
@@ -105,23 +95,8 @@ initial_hand_pos = np.array([
     help="Robot action latency",
 )
 @click.option("-eh", "--exec_horizon", type=int, default=8, help="Execution horizon")
-@click.option(
-    "-vp",
-    "--video_record_path",
-    type=str,
-    default="video_record",
-    help="Path to save video recordings",
-)
-@click.option(
-    "-mep",
-    "--match_episode_path",
-    type=str,
-    default=None,
-    help="Path to match episode folder",
-)
 def main(
     frequency,
-    enable_record_camera,
     camera_type,
     model_path,
     ckpt,
@@ -129,8 +104,6 @@ def main(
     hand_action_latency,
     robot_action_latency,
     exec_horizon,
-    video_record_path,
-    match_episode_path,
 ):
     # Initialize HTTP clients for robot and hand control
     robot_client = HTTPRobotClient(base_url="http://127.0.0.1:5000")
@@ -144,25 +117,13 @@ def main(
             return
         
         # Use the first available camera for observation
-        # Configure for 240x240 output to match training data
         obs_camera = RealSenseCamera(
             camera_name="obs camera",
             device_id=all_cameras[0],
-            camera_resolution=(640, 480),  # Native resolution
-            enable_depth=False,  # We don't need depth for inference
+            camera_resolution=(640, 480),
+            enable_depth=False,
             fps=30
         )
-        camera_sources = [obs_camera]
-        
-        if enable_record_camera and len(all_cameras) > 1:
-            record_camera = RealSenseCamera(
-                camera_name="record camera",
-                device_id=all_cameras[1],
-                camera_resolution=(640, 480),
-                enable_depth=False,
-                fps=30
-            )
-            camera_sources.append(record_camera)
     else:
         # Fall back to OAK cameras
         from dexumi.camera.oak_camera import OakCamera, get_all_oak_cameras
@@ -172,53 +133,16 @@ def main(
             return
         
         obs_camera = OakCamera("obs camera", device_id=all_cameras[0])
-        camera_sources = [obs_camera]
-        
-        if enable_record_camera and len(all_cameras) > 1:
-            record_camera = OakCamera("record camera", device_id=all_cameras[1])
-            camera_sources.append(record_camera)
-    # Start cameras
-    for camera in camera_sources:
-        camera.start_streaming()
     
-    video_recorder = VideoRecorder(
-        record_fps=45,
-        stream_fps=60,
-        video_record_path=video_record_path,
-        camera_sources=camera_sources,
-        frame_data_class=FrameData,
-        verbose=False,
-    )
-    recorder_manager = RecorderManager(
-        recorders=[video_recorder],
-        verbose=False,
-    )
-    recorder_manager.start_streaming()
+    # Start camera
+    obs_camera.start_streaming()
+    
 
     dt = 1 / frequency
-    match_episode_folder = match_episode_path
     
-    # Main control loop (without manual control)
+    # Main control loop
     while True:
-        print("Ready!")
-        
-        # Handle match episode if provided
-        if match_episode_folder is not None:
-            print(
-                f"Extracting frames from match episode {recorder_manager.episode_id}"
-            )
-            # Extract frames for reference (not used in simplified version)
-            _ = extract_frames_videos(
-                os.path.join(
-                    match_episode_folder,
-                    f"episode_{recorder_manager.episode_id}/camera_1.mp4",
-                ),
-                BGR2RGB=True,
-            )
-            # match_initial_frame = match_episode[0]  # Not used in simplified version
-        else:
-            print("No match episode folder provided")
-            # match_initial_frame = None  # Not used in simplified version
+        print("Ready! Starting 20-second inference session...")
             
         # Reset robot to initial position
         print("Moving robot to initial position...")
@@ -263,36 +187,21 @@ def main(
             model_path=model_path,
             ckpt=ckpt,
         )
-        
-        # Start recording
-        if recorder_manager.reset_episode_recording():
-            click.echo("Starting recording...")
-            recorder_manager.start_recording()
 
         # Calculate inference parameters
         inference_iter_time = exec_horizon * dt
         inference_fps = 1 / inference_iter_time
         print("inference_fps", inference_fps)
         
+        # Start 20-second inference session
+        session_start_time = time.time()
+        session_duration = 20.0  # 20 seconds
+        
         # Policy execution loop
-        while True:
+        while time.time() - session_start_time < session_duration:
                 with FrameRateContext(frame_rate=inference_fps):
-                    # gather observation
-                    record_frame = recorder_manager.get_latest_frames()
-                    if enable_record_camera:
-                        video_frame = record_frame["record camera"][-1]
-                        viz_frame = video_frame.rgb.copy()
-                        cv2.putText(
-                            viz_frame,
-                            f"Episode: {recorder_manager.episode_id}",
-                            (10, 30),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            1,
-                            (0, 255, 0),
-                            2,
-                        )
-
-                    obs_frame = record_frame["obs camera"][-1]
+                    # Get observation from camera
+                    obs_frame = obs_camera.get_latest_frame()
                     obs_frame_recieved_time = obs_frame.receive_time
                     obs_frame_rgb = obs_frame.rgb.copy()
                     
@@ -306,76 +215,7 @@ def main(
                         cropped = obs_frame_rgb[start_y:start_y+crop_size, start_x:start_x+crop_size]
                         # Resize to 240x240
                         obs_frame_rgb = cv2.resize(cropped, (240, 240), interpolation=cv2.INTER_AREA)
-                    cv2.putText(
-                        obs_frame_rgb,
-                        f"Episode: {recorder_manager.episode_id}",
-                        (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        1,
-                        (0, 255, 0),
-                        2,
-                    )
-                    if policy.model_cfg.dataset.enable_fsr:
-                        # Draw FSR values on viz_frame
-                        cv2.putText(
-                            obs_frame_rgb,
-                            f"FSR1: {fsr_value[0]:.0f}",
-                            (10, 60),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            1,
-                            (0, 255, 0),
-                            2,
-                        )
-                        cv2.putText(
-                            obs_frame_rgb,
-                            f"FSR2: {fsr_value[1]:.0f}",
-                            (10, 90),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            1,
-                            (0, 255, 0),
-                            2,
-                        )
-                        # Draw binary cutoff values
-                        cv2.putText(
-                            obs_frame_rgb,
-                            f"FSR1 Binary: {int(fsr_value[0] > binary_cutoff[0])}",
-                            (10, 120),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            1,
-                            (0, 255, 0),
-                            2,
-                        )
-                        cv2.putText(
-                            obs_frame_rgb,
-                            f"FSR2 Binary: {int(fsr_value[1] > binary_cutoff[1])}",
-                            (10, 150),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            1,
-                            (0, 255, 0),
-                            2,
-                        )
-                        cv2.putText(
-                            obs_frame_rgb,
-                            f"FSR3 Binary: {int(fsr_value[2] > binary_cutoff[2])}",
-                            (10, 210),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            1,
-                            (0, 255, 0),
-                            2,
-                        )
-                    cv2.imshow("obs frame", obs_frame_rgb)
-                    if enable_record_camera:
-                        cv2.imshow("record frame", viz_frame)
-                    key = cv2.waitKey(1) & 0xFF
-                    if key == ord("q"):
-                        if recorder_manager.stop_recording():
-                            recorder_manager.save_recordings()
-                        cv2.destroyAllWindows()
-                        break
-                    elif key == ord("a"):
-                        if recorder_manager.stop_recording():
-                            recorder_manager.clear_recording()
-                        break
+                    print(f"Time remaining: {session_duration - (time.time() - session_start_time):.1f}s")
                     if policy.model_cfg.dataset.enable_fsr:
                         print("Using FSR")
                         fsr_raw_obs = dexhand_client.get_tactile(calc=True)
@@ -534,7 +374,30 @@ def main(
                     print(
                         f"Scheduled actions: {robot_scheduled} robot waypoints, {hand_scheduled} hand waypoints"
                     )
-                    virtual_hand_pos = hand_action[exec_horizon + 1]
+                    if len(hand_action) > exec_horizon + 1:
+                        virtual_hand_pos = hand_action[exec_horizon + 1]
+                    else:
+                        virtual_hand_pos = hand_action[-1]
+        
+        # Session completed, reset to initial positions
+        print("20-second session completed. Resetting to initial positions...")
+        
+        # Reset robot to initial position
+        initial_pose_6d = np.zeros(6)
+        initial_pose_6d[:3] = initial_robot_pose[:3]
+        initial_pose_6d[3:] = st.Rotation.from_quat(initial_robot_pose[3:]).as_rotvec()
+        robot_client.schedule_waypoint(initial_pose_6d, time.time())
+        
+        # Reset hand to initial position
+        for _ in range(3):
+            dexhand_client.schedule_waypoint(
+                target_pos=initial_hand_pos,
+                target_time=time.time() + 0.05,
+            )
+            time.sleep(1)
+        
+        print("Reset completed. Ready for next session.")
+        time.sleep(2)
 
 
 if __name__ == "__main__":
