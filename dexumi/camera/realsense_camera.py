@@ -122,19 +122,27 @@ class RealSenseCamera(Camera):
 
     def start_streaming(self):
         try:
-            # Get device info and validate RGB camera
+            # Get device info and validate color stream support
             pipeline_wrapper = rs.pipeline_wrapper(self.pipeline)
             pipeline_profile = self.config.resolve(pipeline_wrapper)
             device = pipeline_profile.get_device()
 
-            found_rgb = False
+            found_color = False
             for sensor in device.sensors:
-                if sensor.get_info(rs.camera_info.name) == "RGB Camera":
-                    found_rgb = True
-                    break
+                # Check if sensor supports color stream
+                try:
+                    profiles = sensor.get_stream_profiles()
+                    for profile in profiles:
+                        if profile.stream_type() == rs.stream.color:
+                            found_color = True
+                            break
+                    if found_color:
+                        break
+                except:
+                    continue
 
-            if not found_rgb:
-                raise RuntimeError("The RealSense device does not have an RGB camera")
+            if not found_color:
+                raise RuntimeError("The RealSense device does not support color stream")
 
             # Start streaming
             self.profile = self.pipeline.start(self.config)
