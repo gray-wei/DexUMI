@@ -5,7 +5,7 @@ import numpy as np
 import torch
 from dexumi.common.utility.file import read_pickle
 from dexumi.common.utility.model import load_config, load_diffusion_model
-from dexumi.constants import INPAINT_RESIZE_RATIO
+# INPAINT_RESIZE_RATIO is no longer needed since we use center cropping
 from dexumi.diffusion_policy.dataloader.diffusion_bc_dataset import (
     normalize_data,
     process_image,
@@ -104,8 +104,6 @@ class RealPolicy:
         Returns:
             action: 预测的动作序列
         """
-        # 获取视觉观测的尺寸信息
-        _, H, W, _ = visual_obs.shape
         B = 1  # 批次大小为1（单次预测）
         # 处理本体感受数据
         if proprioception is not None and "proprioception" in self.stats:
@@ -130,28 +128,32 @@ class RealPolicy:
             print("Warning: fsr data provided but no stats available, setting to None")
             fsr = None
 
-        # 处理视觉观测数据
-        # 1. 调整图像尺寸并转换颜色空间（BGR到RGB）
-        visual_obs = np.array(
-            [
-                cv2.cvtColor(
-                    cv2.resize(
-                        obs,
-                        (
-                            int(W * INPAINT_RESIZE_RATIO),  # 按比例调整宽度
-                            int(H * INPAINT_RESIZE_RATIO),  # 按比例调整高度
-                        ),
-                    ),
-                    cv2.COLOR_BGR2RGB,  # BGR转RGB
-                )
-                for obs in visual_obs
-            ]
-        )
+        # 处理视觉观测数据 - 与训练时保持完全一致的处理流程
+        # 1. 中心裁剪到正方形（与XhandMultimodalCollection.py完全一致）
+        processed_obs = []
+        for obs in visual_obs:
+            h, w = obs.shape[:2]  # 应该是 (240, 424, 3)
+            
+            # 中心裁剪为正方形（与训练时完全相同的逻辑）
+            crop_size = min(h, w)  # min(240, 424) = 240
+            start_x = (w - crop_size) // 2  # (424-240)//2 = 92
+            start_y = (h - crop_size) // 2  # (240-240)//2 = 0
+            cropped = obs[start_y:start_y+crop_size, start_x:start_x+crop_size].copy()
+            
+            # 确保正确的240x240尺寸（与训练时一致）
+            if cropped.shape[:2] != (240, 240):
+                cropped = cv2.resize(cropped, (240, 240), interpolation=cv2.INTER_AREA)
+            
+            # BGR转RGB（与训练时一致）
+            rgb_obs = cv2.cvtColor(cropped, cv2.COLOR_BGR2RGB)
+            processed_obs.append(rgb_obs)
         
-        # 2. 进一步处理图像（调整大小、中心裁剪等）
+        visual_obs = np.array(processed_obs)
+        
+        # 2. 使用process_image进行标准化处理（需要添加CenterCrop到224x224以匹配ViT模型）
         visual_obs = process_image(
             visual_obs,
-            optional_transforms=["Resize", "CenterCrop"],
+            optional_transforms=["CenterCrop"],  # 匹配训练时的["Resize", "RandomCrop"]
             resize_shape=self.camera_resize_shape,
         )
         

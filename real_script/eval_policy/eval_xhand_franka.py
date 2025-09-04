@@ -72,10 +72,6 @@ initial_hand_pos = np.array([
 @click.command()
 @click.option("-f", "--frequency", type=float, default=10, help="Control frequency (Hz)")
 @click.option(
-    "-ct", "--camera_type", type=click.Choice(['realsense', 'oak']), default="realsense", 
-    help="Camera type to use"
-)
-@click.option(
     "-mp",
     "--model_path",
     help="Path to the model",
@@ -97,7 +93,6 @@ initial_hand_pos = np.array([
 @click.option("-eh", "--exec_horizon", type=int, default=8, help="Execution horizon")
 def main(
     frequency,
-    camera_type,
     model_path,
     ckpt,
     camera_latency,
@@ -109,30 +104,21 @@ def main(
     robot_client = HTTPRobotClient(base_url="http://127.0.0.1:5000")
     dexhand_client = HTTPHandClient(base_url="http://127.0.0.1:5000")
     
-    # Initialize cameras based on selected type
-    if camera_type == "realsense":
-        all_cameras = get_all_realsense_cameras()
-        if len(all_cameras) < 1:
-            print("Warning: No RealSense cameras found. Exiting...")
-            return
-        
-        # Use the first available camera for observation
-        obs_camera = RealSenseCamera(
-            camera_name="obs camera",
-            device_id=all_cameras[0],
-            camera_resolution=(640, 480),
-            enable_depth=False,
-            fps=30
-        )
-    else:
-        # Fall back to OAK cameras
-        from dexumi.camera.oak_camera import OakCamera, get_all_oak_cameras
-        all_cameras = get_all_oak_cameras()
-        if len(all_cameras) < 1:
-            print("Warning: No OAK cameras found. Exiting...")
-            return
-        
-        obs_camera = OakCamera("obs camera", device_id=all_cameras[0])
+    # Initialize RealSense cameras
+    all_cameras = get_all_realsense_cameras()
+    if len(all_cameras) < 1:
+        print("Warning: No RealSense cameras found. Exiting...")
+        return
+    
+    # Use the first available camera for observation
+    # Match training format exactly: 424x240 BGR -> center crop to 240x240 (same as XhandMultimodalCollection.py)
+    obs_camera = RealSenseCamera(
+        camera_name="obs camera",
+        device_id=all_cameras[0],
+        camera_resolution=(424, 240),  # Exact same as training: 424x240
+        enable_depth=False,
+        fps=30
+    )
     
     # Start camera
     obs_camera.start_streaming()
@@ -205,16 +191,8 @@ def main(
                     obs_frame_recieved_time = obs_frame.receive_time
                     obs_frame_rgb = obs_frame.rgb.copy()
                     
-                    # Ensure image is 240x240 for model input
-                    if obs_frame_rgb.shape[:2] != (240, 240):
-                        # Center crop to square
-                        h, w = obs_frame_rgb.shape[:2]
-                        crop_size = min(h, w)
-                        start_x = (w - crop_size) // 2
-                        start_y = (h - crop_size) // 2
-                        cropped = obs_frame_rgb[start_y:start_y+crop_size, start_x:start_x+crop_size]
-                        # Resize to 240x240
-                        obs_frame_rgb = cv2.resize(cropped, (240, 240), interpolation=cv2.INTER_AREA)
+                    # Note: real_policy.py will handle all image preprocessing
+                    # The image should be in BGR format to match training data
                     print(f"Time remaining: {session_duration - (time.time() - session_start_time):.1f}s")
                     if policy.model_cfg.dataset.enable_fsr:
                         print("Using FSR")
@@ -246,26 +224,40 @@ def main(
                     )
                     print("camera_total_latency", camera_total_latency)
                     t_actual_inference = t_inference - camera_total_latency
-                    # Prepare image for model (ensure 240x240)
-                    model_input_image = obs_frame.rgb.copy()
-                    if model_input_image.shape[:2] != (240, 240):
-                        h, w = model_input_image.shape[:2]
-                        crop_size = min(h, w)
-                        start_x = (w - crop_size) // 2
-                        start_y = (h - crop_size) // 2
-                        cropped = model_input_image[start_y:start_y+crop_size, start_x:start_x+crop_size]
-                        model_input_image = cv2.resize(cropped, (240, 240), interpolation=cv2.INTER_AREA)
+                    
+                    # ============ DEBUG SECTION START ============
+                    print("\n" + "="*50)
+                    print("DEBUG: Input Information")
+                    print(f"Image shape: {obs_frame_rgb.shape}, dtype: {obs_frame_rgb.dtype}")
+                    print(f"Image range: [{obs_frame_rgb.min():.2f}, {obs_frame_rgb.max():.2f}]")
+                    if policy.model_cfg.dataset.enable_fsr:
+                        print(f"FSR obs shape: {np.array(list(fsr_obs)).shape}")
+                        print(f"FSR obs values: {np.array(list(fsr_obs))[-1]}")  # Last FSR reading
                     
                     action = policy.predict_action(
                         None,
                         np.array(list(fsr_obs)).astype(np.float32)
                         if policy.model_cfg.dataset.enable_fsr
                         else None,
-                        model_input_image[None, ...],  # Use processed image
+                        obs_frame_rgb[None, ...],  # Use original image, let real_policy.py handle preprocessing
                     )
+                    
+                    print("\nDEBUG: Raw Action Output")
+                    print(f"Action shape: {action.shape}")
+                    print(f"Action min/max: [{action.min():.4f}, {action.max():.4f}]")
+                    print(f"Action mean/std: [mean={action.mean():.4f}, std={action.std():.4f}]")
+                    
                     # convert to abs action
                     relative_pose = action[:, :6]
                     hand_action = action[:, 6:]
+                    
+                    print("\nDEBUG: Action Components")
+                    print(f"Relative pose (first): {relative_pose[0]}")
+                    print(f"Hand action (first): {hand_action[0][:4]}...")  # Show first 4 joints
+                    print(f"Relative pose norm: {np.linalg.norm(relative_pose[0][:3]):.4f}")  # Position magnitude
+                    print(f"Relative rotation norm: {np.linalg.norm(relative_pose[0][3:]):.4f}")  # Rotation magnitude
+                    # ============ DEBUG SECTION END ============
+                    
                     relative_pose = np.array(
                         [
                             vec6dof_to_homogeneous_matrix(rp[:3], rp[3:])
@@ -339,6 +331,13 @@ def main(
                     for iter_idx in range(len(relative_pose)):
                         # Direct application: T_BN = T_BE @ relative_pose
                         T_BN[iter_idx] = T_BE @ relative_pose[iter_idx]
+                    
+                    # ============ DEBUG: Target Poses ============
+                    print("\nDEBUG: Target Transformation")
+                    print(f"Current EE pose: {ee_aligned_pose[:3]}")  # Current position
+                    print(f"First target pose: {T_BN[0, :3, -1]}")  # First target position
+                    print(f"Position change: {T_BN[0, :3, -1] - ee_aligned_pose[:3]}")  # Delta position
+                    # ============ DEBUG END ============
                     # discard actions which in the past
                     n_action = T_BN.shape[0]
                     t_exec = time.monotonic()
