@@ -3,16 +3,19 @@
 # Evaluation script for XHand with Franka using HTTP control
 
 # Activate conda environment
-source ~/miniconda3/etc/profile.d/conda.sh
+source ~/anaconda3/etc/profile.d/conda.sh
 conda activate dexumi
 
 # Path to your trained model
-MODEL_PATH="/path/to/your/trained/model"  # TODO: Update this path
+MODEL_PATH="/home/ubuntu/hgw/IL/DexUMI/data/weight/vision_tactile_propio"  # TODO: Update this path
 CHECKPOINT=600
 
 # Control parameters
-FREQUENCY=10  # Control frequency in Hz
+FREQUENCY=15  # Control frequency in Hz
 EXEC_HORIZON=8  # Number of action steps to execute before re-predicting
+
+# Visualization settings
+ENABLE_VISUALIZATION=false  # Set to true to enable real-time camera visualization
 
 # Camera configuration
 CAMERA_TYPE="realsense"  # Options: "realsense" or "oak"
@@ -63,14 +66,6 @@ python real_script/eval_policy/eval_xhand_franka.py \
     --ckpt $CHECKPOINT \
     --frequency $FREQUENCY \
     --exec_horizon $EXEC_HORIZON \
-    --camera_type $CAMERA_TYPE \
     --camera_latency $CAMERA_LATENCY \
     --hand_action_latency $HAND_ACTION_LATENCY \
-    --robot_action_latency $ROBOT_ACTION_LATENCY \
-    --video_record_path "$VIDEO_RECORD_PATH"
-
-# Optional: Enable record camera (requires second camera)
-# Add --enable_record_camera flag if you have two cameras
-
-# Optional: Match episode path for comparison
-# --match_episode_path "/path/to/reference/episodes"
+    --robot_action_latency $ROBOT_ACTION_LATENCY

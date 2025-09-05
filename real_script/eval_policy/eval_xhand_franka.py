@@ -52,20 +52,20 @@ initial_robot_pose = np.array([
 obs_horizon = 1
 binary_cutoff = [10, 10, 10]
 
-# Initial hand position (open position)
+# Initial hand position (open position) - Updated to match open_gripper command
 initial_hand_pos = np.array([
-    0.92755819,
-    0.52026953,
-    0.22831853,
-    0.0707963,
-    1.1,
-    0.15707963,
-    0.95,
-    0.12217305,
-    1.0392188,
-    0.03490659,
-    1.0078164,
-    0.17453293,
+    1.516937255859375,
+    0.5177657604217529,
+    0.04799513891339302,
+    0.01787799410521984,
+    0.005817593075335026,
+    0.034905556589365005,
+    0.014543981291353703,
+    0.011635186150670052,
+    0.002908796537667513,
+    0.01599838025867939,
+    0.007271990645676851,
+    0.024724768474698067,
 ])
 
 
@@ -142,14 +142,10 @@ def main(
         
         # Initialize FSR observations
         fsr_obs = deque(maxlen=obs_horizon)
-        fsr_raw_obs = dexhand_client.get_tactile(calc=True)
-        # Reshape fsr_raw_obs to add a batch dimension
-        fsr_raw_obs = fsr_raw_obs[None, ...]  # This adds a dimension at the start
-        fsr_raw_obs = compute_total_force_per_finger(fsr_raw_obs)[0]
-        fsr_value = np.array(fsr_raw_obs[:3])
-        print("fsr_value", fsr_value)
+        
+        # Initialize FSR with proper dimensions
         for _ in range(obs_horizon):
-            fsr_obs.append(np.zeros(2))
+            fsr_obs.append(np.zeros(3, dtype=np.float32))  # 3 fingers, binary values
 
         print(
             "resetting hand----------------------------------------------------------------------------------"
@@ -187,7 +183,7 @@ def main(
         while time.time() - session_start_time < session_duration:
                 with FrameRateContext(frame_rate=inference_fps):
                     # Get observation from camera
-                    obs_frame = obs_camera.get_latest_frame()
+                    obs_frame = obs_camera.get_camera_frame()
                     obs_frame_recieved_time = obs_frame.receive_time
                     obs_frame_rgb = obs_frame.rgb.copy()
                     
@@ -198,21 +194,28 @@ def main(
                         print("Using FSR")
                         fsr_raw_obs = dexhand_client.get_tactile(calc=True)
                         print("raw", fsr_raw_obs)
-                        # Reshape fsr_raw_obs to add a batch dimension
-                        fsr_raw_obs = fsr_raw_obs[
-                            None, ...
-                        ]  # This adds a dimension at the start
-                        fsr_raw_obs = compute_total_force_per_finger(fsr_raw_obs)[0]
-                        fsr_value = np.array(fsr_raw_obs[:3])
+                        print(f"FSR raw shape: {fsr_raw_obs.shape}")
+                        
+                        # Process FSR data - should be (5, 3) -> compute total force per finger -> take first 3 fingers
+                        if fsr_raw_obs.ndim == 2 and fsr_raw_obs.shape[0] >= 3:
+                            # Compute total force per finger (magnitude of 3D force vector)
+                            fsr_total_forces = np.linalg.norm(fsr_raw_obs, axis=1)  # Shape: (5,)
+                            # Take first 3 fingers to match training data
+                            fsr_value = fsr_total_forces[:3]  # Shape: (3,)
+                        else:
+                            # Fallback: if shape is unexpected, try to extract 3 values
+                            fsr_value = fsr_raw_obs.flatten()[:3]
+                        
+                        print(f"fsr_value shape: {fsr_value.shape}")
                         print("fsr_value", fsr_value)
                         fsr_value = fsr_value.astype(np.float32)
-                        # Apply binary cutoff
-                        fsr_value_binary = (fsr_value >= binary_cutoff).astype(
-                            np.float32
-                        )
+                        
+                        # Apply binary cutoff (same as training)
+                        fsr_value_binary = (fsr_value >= binary_cutoff).astype(np.float32)
                         fsr_obs.append(fsr_value_binary)
                     # inference action
                     t_inference = time.monotonic()
+                    t_inference_wall = time.time()  # Wall clock time for interpolation
                     # camera latency + transfer time
                     print(
                         "t_inference|obs_frame_recieved_time",
@@ -223,7 +226,7 @@ def main(
                         camera_latency + t_inference - obs_frame_recieved_time
                     )
                     print("camera_total_latency", camera_total_latency)
-                    t_actual_inference = t_inference - camera_total_latency
+                    t_actual_inference = t_inference_wall - camera_total_latency
                     
                     # ============ DEBUG SECTION START ============
                     print("\n" + "="*50)
@@ -234,8 +237,27 @@ def main(
                         print(f"FSR obs shape: {np.array(list(fsr_obs)).shape}")
                         print(f"FSR obs values: {np.array(list(fsr_obs))[-1]}")  # Last FSR reading
                     
+                    # Get robot proprioception data for model input
+                    robot_state = robot_client.get_state()
+                    proprioception = None
+                    
+                    if robot_state and "state" in robot_state:
+                        # Extract joint positions and velocities
+                        joint_q = np.array(robot_state["state"]["ActualQ"])  # 7D joint positions
+                        joint_dq = np.array(robot_state["state"]["ActualQd"])  # 7D joint velocities
+                        # Create 14D proprioception vector: [joint_q, joint_dq]
+                        proprioception = np.concatenate([joint_q, joint_dq]).astype(np.float32)
+                        
+                        print(f"Proprioception shape: {proprioception.shape}")
+                        print(f"Joint positions: {joint_q}")
+                        print(f"Joint velocities: {joint_dq}")
+                    else:
+                        # Fallback to zeros if state unavailable
+                        proprioception = np.zeros(14, dtype=np.float32)
+                        print("Warning: Robot state unavailable, using zero proprioception")
+
                     action = policy.predict_action(
-                        None,
+                        proprioception[None, ...] if proprioception is not None else None,  # Add batch dimension
                         np.array(list(fsr_obs)).astype(np.float32)
                         if policy.model_cfg.dataset.enable_fsr
                         else None,
@@ -310,13 +332,33 @@ def main(
                     robot_timestamp = np.array(robot_timestamp)
                     robot_homogeneous_matrix = np.array(robot_homogeneous_matrix)
                     
-                    # Interpolate to get pose at inference time
-                    robot_pose_interpolator = PoseInterpolator(
-                        timestamps=robot_timestamp,
-                        homogeneous_matrix=robot_homogeneous_matrix,
-                    )
-                    aligned_pose = robot_pose_interpolator([t_actual_inference])[0]
-                    ee_aligned_pose = homogeneous_matrix_to_6dof(aligned_pose)
+                    # Handle insufficient history for interpolation
+                    if len(robot_frames) < 2:
+                        print(f"Warning: Only {len(robot_frames)} robot states in history, using current state")
+                        # Use current robot state directly
+                        current_state = robot_client.get_state()
+                        tcp_pose = current_state["state"]["ActualTCPPose"]
+                        xyz = tcp_pose[:3]
+                        if len(tcp_pose) == 7:
+                            rotvec = st.Rotation.from_quat(tcp_pose[3:]).as_rotvec()
+                        else:
+                            rotvec = tcp_pose[3:]
+                        aligned_pose_matrix = vec6dof_to_homogeneous_matrix(xyz, rotvec)
+                        aligned_pose = homogeneous_matrix_to_6dof(aligned_pose_matrix)
+                    else:
+                        # Interpolate to get pose at inference time
+                        try:
+                            robot_pose_interpolator = PoseInterpolator(
+                                timestamps=robot_timestamp,
+                                homogeneous_matrix=robot_homogeneous_matrix,
+                            )
+                            aligned_pose_matrix = robot_pose_interpolator([t_actual_inference])[0]
+                            aligned_pose = homogeneous_matrix_to_6dof(aligned_pose_matrix)
+                        except ValueError as e:
+                            print(f"Interpolation failed: {e}, using most recent state")
+                            # Fallback to most recent state
+                            aligned_pose = homogeneous_matrix_to_6dof(robot_homogeneous_matrix[-1])
+                    ee_aligned_pose = aligned_pose
                     
                     # Build current end-effector transformation matrix T_BE
                     T_BE = np.eye(4)
