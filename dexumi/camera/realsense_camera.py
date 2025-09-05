@@ -83,7 +83,7 @@ class RealSenseCamera(Camera):
             try:
                 # Wait for a coherent pair of frames
                 frames = self.pipeline.wait_for_frames()
-                receive_time = time.monotonic()
+                receive_time = time.time()  # Changed to wall clock time for consistency with HTTP client
 
                 if self.align_to_color and self.enable_depth:
                     frames = self.align.process(frames)

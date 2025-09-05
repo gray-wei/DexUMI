@@ -213,10 +213,9 @@ def main(
                         # Apply binary cutoff (same as training)
                         fsr_value_binary = (fsr_value >= binary_cutoff).astype(np.float32)
                         fsr_obs.append(fsr_value_binary)
-                    # inference action
-                    t_inference = time.monotonic()
-                    t_inference_wall = time.time()  # Wall clock time for interpolation
-                    # camera latency + transfer time
+                    # inference action - use wall clock time consistently
+                    t_inference = time.time()  # Use wall clock time consistently with camera and HTTP client
+                    # camera latency + transfer time (both now in wall clock time)
                     print(
                         "t_inference|obs_frame_recieved_time",
                         t_inference,
@@ -226,7 +225,15 @@ def main(
                         camera_latency + t_inference - obs_frame_recieved_time
                     )
                     print("camera_total_latency", camera_total_latency)
-                    t_actual_inference = t_inference_wall - camera_total_latency
+                    t_actual_inference = t_inference - camera_total_latency
+                    
+                    # ============ TIMESTAMP VERIFICATION ============
+                    print(f"\n🕒 TIMESTAMP DEBUG:")
+                    print(f"  Camera timestamp: {obs_frame_recieved_time:.3f} (wall time)")
+                    print(f"  Inference timestamp: {t_inference:.3f} (wall time)")
+                    print(f"  Camera to inference delay: {t_inference - obs_frame_recieved_time:.3f}s (should be < 0.1s)")
+                    print(f"  Actual inference timestamp: {t_actual_inference:.3f} (wall time)")
+                    # ============ TIMESTAMP VERIFICATION END ============
                     
                     # ============ DEBUG SECTION START ============
                     print("\n" + "="*50)
@@ -332,6 +339,14 @@ def main(
                     robot_timestamp = np.array(robot_timestamp)
                     robot_homogeneous_matrix = np.array(robot_homogeneous_matrix)
                     
+                    # ============ ROBOT TIMESTAMP VERIFICATION ============
+                    if len(robot_timestamp) > 0:
+                        print(f"🤖 ROBOT TIMESTAMP DEBUG:")
+                        print(f"  Latest robot timestamp: {robot_timestamp[-1]:.3f} (wall time)")
+                        print(f"  Robot timestamps range: {len(robot_timestamp)} samples")
+                        print(f"  Time gap robot->inference: {t_actual_inference - robot_timestamp[-1]:.3f}s")
+                    # ============ ROBOT TIMESTAMP VERIFICATION END ============
+                    
                     # Handle insufficient history for interpolation
                     if len(robot_frames) < 2:
                         print(f"Warning: Only {len(robot_frames)} robot states in history, using current state")
@@ -382,15 +397,22 @@ def main(
                     # ============ DEBUG END ============
                     # discard actions which in the past
                     n_action = T_BN.shape[0]
-                    t_exec = time.monotonic()
+                    t_exec = time.time()  # Use wall clock time consistently
                     robot_scheduled = 0
                     hand_scheduled = 0
 
                     # Process robot waypoints
                     robot_times = t_actual_inference + np.arange(n_action) * dt
                     valid_robot_idx = robot_times >= t_exec + robot_action_latency + dt
-                    # convert to global time
-                    robot_times = robot_times - time.monotonic() + time.time()
+                    # robot_times are already in wall clock time, no conversion needed
+                    
+                    # ============ SCHEDULING TIME VERIFICATION ============ 
+                    print(f"📅 SCHEDULING DEBUG:")
+                    print(f"  Current execution time: {t_exec:.3f}")
+                    print(f"  First robot waypoint time: {robot_times[0]:.3f}")
+                    print(f"  Time until first execution: {robot_times[0] - t_exec:.3f}s")
+                    print(f"  Valid robot actions: {np.sum(valid_robot_idx)}/{n_action}")
+                    # ============ SCHEDULING TIME VERIFICATION END ============
                     for k in np.where(valid_robot_idx)[0]:
                         target_pose = np.zeros(6)
                         target_pose[:3] = T_BN[k, :3, -1]
@@ -403,8 +425,7 @@ def main(
                     # Process hand waypoints
                     hand_times = t_actual_inference + np.arange(n_action) * dt
                     valid_hand_idx = hand_times >= t_exec + hand_action_latency + dt
-                    # convert to global time
-                    hand_times = hand_times - time.monotonic() + time.time()
+                    # hand_times are already in wall clock time, no conversion needed
                     for k in np.where(valid_hand_idx)[0]:
                         target_hand_action = hand_action[k]
                         dexhand_client.schedule_waypoint(
