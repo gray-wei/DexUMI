@@ -43,20 +43,24 @@ class CollectionState(Enum):
 class CameraCollector:
     """独立相机采集器 - 高帧率采集，记录硬件时间戳"""
     
-    def __init__(self):
-        self.camera_data = []  # 存储采集的相机帧
+    def __init__(self, max_frames_per_camera: int = 10000):
+        self.camera_data = {}  # 改为每个相机独立的数据列表 {camera_id: [frames]}
         self._state = CollectionState.STOPPED
         self._state_lock = threading.Lock()
-        self.lock = threading.Lock()
+        self.locks = {}  # {camera_id: threading.Lock()}
         self._last_frame_hash = {}  # 用于检测重复帧
+        self._hash_lock = threading.Lock()  # 保护 _last_frame_hash 的锁
+        self.max_frames_per_camera = max_frames_per_camera  # 每个相机最大帧数限制
         
     def start_collecting(self):
         """开始新的采集会话（清空数据）"""
         with self._state_lock:
             self._state = CollectionState.RUNNING
-        with self.lock:
-            self.camera_data = []
-            self._last_frame_hash = {}
+        # 清空所有相机的数据
+        for cam_id in self.camera_data:
+            with self.locks[cam_id]:
+                self.camera_data[cam_id] = []
+        self._last_frame_hash = {}
         
     def resume_collecting(self, pipelines=None):
         """恢复采集（保持现有数据）"""
@@ -115,41 +119,75 @@ class CameraCollector:
             
         # 检查图像内容是否变化（可选 - 用于调试）
         current_hash = hash(rgb[::8, ::8].tobytes())  # 使用降采样避免计算开销
-        if cam_id in self._last_frame_hash:
-            if current_hash == self._last_frame_hash[cam_id]:
-                logger.debug(f"警告: 相机{cam_id}图像内容可能重复")
-                # 注意：这里不返回False，因为某些场景下图像确实可能相同
-        self._last_frame_hash[cam_id] = current_hash
+        
+        # 使用锁保护 _last_frame_hash 的读写
+        with self._hash_lock:
+            if cam_id in self._last_frame_hash:
+                if current_hash == self._last_frame_hash[cam_id]:
+                    logger.debug(f"警告: 相机{cam_id}图像内容可能重复")
+                    # 注意：这里不返回False，因为某些场景下图像确实可能相同
+            self._last_frame_hash[cam_id] = current_hash
             
         return True
         
     def get_current_frame(self) -> Optional[Dict]:
         """获取最新的相机帧（用于实时显示）"""
-        with self.lock:
-            if self.camera_data:
-                return self.camera_data[-1]
-        return None
+        # 使用固定顺序加锁避免死锁
+        latest_frame = {}
+        sorted_cam_ids = sorted(self.camera_data.keys())  # 固定加锁顺序
+        
+        for cam_id in sorted_cam_ids:
+            with self.locks[cam_id]:
+                if self.camera_data[cam_id]:
+                    # 快速复制引用，减少锁持有时间
+                    latest_frame.update(self.camera_data[cam_id][-1])
+        
+        return latest_frame if latest_frame else None
     
     def get_collected_data(self) -> List[Dict]:
         """获取已采集的所有相机数据"""
-        with self.lock:
-            return self.camera_data.copy()
+        # 合并所有相机的数据
+        merged_data = []
+        
+        # 找到最短的相机数据长度（用于同步）
+        min_length = float('inf')
+        for cam_id in self.camera_data:
+            with self.locks[cam_id]:
+                length = len(self.camera_data[cam_id])
+                if length > 0:
+                    min_length = min(min_length, length)
+        
+        if min_length == float('inf'):
+            return []
+        
+        # 按时间戳顺序合并数据
+        for i in range(min_length):
+            frame_data = {}
+            for cam_id in self.camera_data:
+                with self.locks[cam_id]:
+                    if i < len(self.camera_data[cam_id]):
+                        frame_data.update(self.camera_data[cam_id][i])
+            merged_data.append(frame_data)
+        
+        return merged_data
     
     def clear_data(self):
         """清空采集数据"""
-        with self.lock:
-            self.camera_data = []
+        for cam_id in self.camera_data:
+            with self.locks[cam_id]:
+                self.camera_data[cam_id] = []
 
 
 class RobotDataCollector:
     """独立机器人数据采集器 - 固定频率采集HTTP数据"""
     
-    def __init__(self, url: str = "http://127.0.0.1:5000/"):
+    def __init__(self, url: str = "http://127.0.0.1:5000/", max_frames: int = 10000):
         self.url = url
         self.robot_data = []  # 存储采集的机器人数据
         self._state = CollectionState.STOPPED
         self._state_lock = threading.Lock()
         self.lock = threading.Lock()
+        self.max_frames = max_frames  # 最大帧数限制
         
     def start_collecting(self):
         """开始新的采集会话（清空数据）"""
@@ -288,7 +326,7 @@ class DataCollectionController:
 class XhandMultimodalDataCollector:
     """XHand + Franka多模态数据采集接口"""
     
-    def __init__(self, num_cameras: int = 1, xhand_port: str = "/dev/ttyUSB0"):
+    def __init__(self, num_cameras: int = 2, xhand_port: str = "/dev/ttyUSB0"):
         self.num_cameras = num_cameras
         self.xhand_port = xhand_port
         self.url = "http://127.0.0.1:5000/"
@@ -301,9 +339,9 @@ class XhandMultimodalDataCollector:
         self.camera_collector = CameraCollector()
         self.robot_collector = RobotDataCollector(self.url)
         
-        # 相机线程
+        # 相机线程管理
         self.camera_running = False
-        self.camera_thread = None
+        self.camera_threads = []  # 改为线程列表，每个相机一个线程
         self.robot_thread = None
         
         # 性能统计
@@ -317,9 +355,16 @@ class XhandMultimodalDataCollector:
         # 初始化系统
         self._init_cameras()
         
+        # 为每个相机初始化独立的锁和数据存储
+        for cam_info in self.pipelines:
+            cam_id = cam_info['camera_id']
+            self.camera_collector.locks[cam_id] = threading.Lock()
+            self.camera_collector.camera_data[cam_id] = []
+        
         print("✓ XHand + Franka多模态数据采集系统初始化完成")
         print("✓ 相机分辨率: 240x240 (匹配DexUMI训练需求)")
         print("✓ 独立采集模式已启用")
+        print(f"✓ 初始化了 {len(self.pipelines)} 个相机的独立数据存储")
         
         # 初始化重置
         print("\n执行初始化重置...")
@@ -327,8 +372,9 @@ class XhandMultimodalDataCollector:
     
     def _init_cameras(self):
         """初始化相机 - 240x240分辨率"""
-        top_serial = "244622072813"
-        wrist_serial = "230322271519"
+        # 更新为当前实际连接的相机序列号
+        top_serial = "218622274962"    # 更新序列号 , 218622274962
+        wrist_serial = "218622270499"  # 更新序列号 ,  218622270499
         
         try:
             ctx = rs.context()
@@ -387,10 +433,18 @@ class XhandMultimodalDataCollector:
     
     def start_collection(self):
         """启动独立的数据采集线程"""
-        # 启动相机采集线程
+        # 启动每个相机的独立采集线程
         self.camera_running = True
-        self.camera_thread = threading.Thread(target=self._camera_thread, daemon=True)
-        self.camera_thread.start()
+        self.camera_threads = []
+        
+        for cam_info in self.pipelines:
+            camera_thread = threading.Thread(
+                target=self._single_camera_thread, 
+                args=(cam_info,),
+                daemon=True
+            )
+            camera_thread.start()
+            self.camera_threads.append(camera_thread)
         
         # 启动机器人数据采集线程
         self.robot_thread = threading.Thread(target=self._robot_thread, daemon=True)
@@ -400,10 +454,10 @@ class XhandMultimodalDataCollector:
         self.camera_collector.start_collecting()
         self.robot_collector.start_collecting()
         
-        print("✓ 独立采集线程已启动")
+        print(f"✓ 启动了 {len(self.camera_threads)} 个相机独立采集线程")
     
     def stop_collection(self):
-        """停止数据采集"""
+        """停止数据采集并验证线程停止"""
         # 停止采集
         self.camera_collector.stop_collecting()
         self.robot_collector.stop_collecting()
@@ -411,110 +465,106 @@ class XhandMultimodalDataCollector:
         # 停止线程
         self.camera_running = False
         
-        if self.camera_thread:
-            self.camera_thread.join(timeout=2.0)
+        # 等待所有相机线程结束，并验证
+        for i, thread in enumerate(self.camera_threads):
+            thread.join(timeout=5.0)
+            if thread.is_alive():
+                logger.warning(f"警告: 相机线程 {i} 未能在5秒内停止")
+                # 这里可以考虑强制终止，但Python线程不支持强制终止
+                # 最好的做法是确保线程内部有正确的退出逻辑
+        
         if self.robot_thread:
-            self.robot_thread.join(timeout=2.0)
+            self.robot_thread.join(timeout=5.0)
+            if self.robot_thread.is_alive():
+                logger.warning("警告: 机器人线程未能在5秒内停止")
+        
+        # 清理线程列表
+        self.camera_threads = []
+        self.robot_thread = None
         
         print("✓ 数据采集已停止")
     
-    def _camera_thread(self):
-        """相机采集线程 - 最大帧率采集"""
-        print("相机采集线程启动")
+    def _single_camera_thread(self, cam_info):
+        """单个相机的独立采集线程"""
+        camera_id = cam_info['camera_id']
+        print(f"相机 {camera_id} 采集线程启动 (序列号: {cam_info['serial']})")
         frame_counter = 0
         
         while self.camera_running:
             if not self.camera_collector.is_running():
-                # 不采集时持续消费帧，防止缓冲区积累旧数据
-                for cam_info in self.pipelines:
-                    try:
-                        # 使用try_wait_for_frames短时间等待并丢弃帧
-                        frames = cam_info['pipeline'].try_wait_for_frames(timeout_ms=10)
-                    except:
-                        pass
+                # 不采集时持续消费帧，防止缓冲区积累
+                try:
+                    frames = cam_info['pipeline'].try_wait_for_frames(timeout_ms=10)
+                except:
+                    pass
                 time.sleep(0.01)
                 continue
                 
             try:
                 capture_start = time.time()
-                frame_data = {}
                 
-                # 获取所有相机帧
-                for cam_info in self.pipelines:
-                    try:
-                        # 等待新帧，设置合理超时时间
-                        frames = cam_info['pipeline'].wait_for_frames(timeout_ms=50)
-                        if not frames:
-                            continue
-                            
-                        color_frame = frames.get_color_frame()
-                        
-                        if color_frame:
-                            # 记录硬件时间戳和系统时间戳
-                            hardware_timestamp = color_frame.get_timestamp()  # 硬件时间戳
-                            system_timestamp = time.time()  # 系统时间戳
-                            
-                            # 增加帧计数器用于调试
-                            frame_counter += 1
-                            
-                            # 获取原始图像并处理为240x240
-                            # 安全的内存拷贝
-                            raw_img = np.asanyarray(color_frame.get_data()).copy()  # (240, 424, 3)
-                            
-                            # 中心裁剪为240x240
-                            h, w = raw_img.shape[:2]
-                            crop_size = min(h, w)  # 240
-                            start_x = (w - crop_size) // 2  # (424-240)//2 = 92
-                            start_y = (h - crop_size) // 2  # 0
-                            
-                            # 使用copy()确保是独立的数组，不是视图
-                            cropped = raw_img[start_y:start_y+crop_size, start_x:start_x+crop_size].copy()
-                            
-                            # 确保正确的240x240尺寸
-                            if cropped.shape[:2] != (240, 240):
-                                cropped = cv2.resize(cropped, (240, 240), interpolation=cv2.INTER_AREA)
-                            
-                            frame_data[f'camera_{cam_info["camera_id"]}'] = {
-                                'rgb': cropped,
-                                'hardware_timestamp': hardware_timestamp,
-                                'system_timestamp': system_timestamp,
-                                'capture_time': capture_start
-                            }
-                    except Exception as e:
-                        logger.debug(f"相机 {cam_info['camera_id']} 获取帧失败: {e}")
-                
-                # 验证和存储相机数据
-                if frame_data:
-                    # 验证帧数据有效性
-                    valid_frames = {}
-                    for cam_key, cam_data in frame_data.items():
-                        if cam_key.startswith('camera_'):
-                            cam_id = int(cam_key.split('_')[1])
-                            if self.camera_collector._validate_frame(cam_data, cam_id):
-                                valid_frames[cam_key] = cam_data
-                            else:
-                                logger.debug(f"相机 {cam_id} 帧数据验证失败")
+                # 获取相机帧
+                frames = cam_info['pipeline'].wait_for_frames(timeout_ms=50)
+                if not frames:
+                    continue
                     
-                    # 只存储验证成功的帧
-                    if valid_frames:
-                        with self.camera_collector.lock:
-                            self.camera_collector.camera_data.append(valid_frames)
+                color_frame = frames.get_color_frame()
                 
-                # 更新FPS统计
-                now = time.time()
-                if self.perf_stats['last_camera_time'] > 0:
-                    fps = 1.0 / (now - self.perf_stats['last_camera_time'])
-                    self.perf_stats['camera_fps'].append(fps)
-                self.perf_stats['last_camera_time'] = now
-                
+                if color_frame:
+                    # 记录时间戳
+                    hardware_timestamp = color_frame.get_timestamp()
+                    system_timestamp = time.time()
+                    frame_counter += 1
+                    
+                    # 处理图像
+                    raw_img = np.asanyarray(color_frame.get_data()).copy()
+                    
+                    # 中心裁剪为240x240
+                    h, w = raw_img.shape[:2]
+                    crop_size = min(h, w)
+                    start_x = (w - crop_size) // 2
+                    start_y = (h - crop_size) // 2
+                    cropped = raw_img[start_y:start_y+crop_size, start_x:start_x+crop_size].copy()
+                    
+                    if cropped.shape[:2] != (240, 240):
+                        cropped = cv2.resize(cropped, (240, 240), interpolation=cv2.INTER_AREA)
+                    
+                    frame_data = {
+                        f'camera_{camera_id}': {
+                            'rgb': cropped,
+                            'hardware_timestamp': hardware_timestamp,
+                            'system_timestamp': system_timestamp,
+                            'capture_time': capture_start
+                        }
+                    }
+                    
+                    # 线程安全地存储数据，实施有界缓冲
+                    with self.camera_collector.locks[camera_id]:
+                        cam_data = self.camera_collector.camera_data[camera_id]
+                        cam_data.append(frame_data)
+                        
+                        # 如果超过最大帧数限制，移除最旧的帧（FIFO）
+                        if len(cam_data) > self.camera_collector.max_frames_per_camera:
+                            cam_data.pop(0)  # 移除最旧的帧
+                            logger.debug(f"相机{camera_id}达到最大帧数限制，移除最旧帧")
+                    
+                    # 更新FPS统计 - 为每个相机独立统计
+                    now = time.time()
+                    if hasattr(self, f'_last_camera_{camera_id}_time'):
+                        last_time = getattr(self, f'_last_camera_{camera_id}_time')
+                        if last_time > 0:
+                            fps = 1.0 / (now - last_time)
+                            self.perf_stats['camera_fps'].append(fps)
+                    setattr(self, f'_last_camera_{camera_id}_time', now)
+                    
             except Exception as e:
-                logger.debug(f"相机采集错误: {e}")
+                logger.debug(f"相机 {camera_id} 采集错误: {e}")
             
-            # 控制轮询频率
-            time.sleep(0.005)  # 5ms轮询间隔，在性能和稳定性间平衡
+            # 最小延迟，让CPU有机会调度其他线程
+            time.sleep(0.001)  # 1ms
         
-        print("相机采集线程停止")
-    
+        print(f"相机 {camera_id} 采集线程停止")
+
     def _robot_thread(self):
         """机器人数据采集线程 - 固定20Hz采集"""
         print("机器人采集线程启动")
@@ -536,8 +586,6 @@ class XhandMultimodalDataCollector:
                 tactile_response = requests.post(self.url + "get_handtactile", timeout=1.0)
                 tactile_data = tactile_response.json()
                 tactile_end = time.time()
-
-                # ly TODO: send object pose here from Foundationpose
                 
                 # 计算网络延迟
                 robot_delay = request_end - request_start
@@ -569,9 +617,14 @@ class XhandMultimodalDataCollector:
                     'network_delay_tactile': tactile_delay
                 }
                 
-                # 存储机器人数据
+                # 存储机器人数据，实施有界缓冲
                 with self.robot_collector.lock:
                     self.robot_collector.robot_data.append(state_data)
+                    
+                    # 如果超过最大帧数限制，移除最旧的帧
+                    if len(self.robot_collector.robot_data) > self.robot_collector.max_frames:
+                        self.robot_collector.robot_data.pop(0)
+                        logger.debug("机器人数据达到最大帧数限制，移除最旧帧")
                 
                 # 更新FPS统计
                 now = time.time()
@@ -664,17 +717,37 @@ class XhandMultimodalDataCollector:
             'robot_frames': len(self.robot_collector.get_collected_data())
         }
     
-    def __del__(self):
-        """清理资源"""
+    def cleanup(self):
+        """显式清理资源 - 应该在程序退出前调用"""
         try:
+            # 停止所有采集
             self.stop_collection()
+            
+            # 关闭所有相机pipeline
             for cam_info in self.pipelines:
                 try:
                     cam_info['pipeline'].stop()
-                except:
-                    pass
+                    logger.info(f"相机 {cam_info['camera_id']} pipeline已关闭")
+                except Exception as e:
+                    logger.error(f"关闭相机 {cam_info['camera_id']} 失败: {e}")
+            
+            # 清空pipeline列表
+            self.pipelines = []
+            
+            logger.info("✓ 所有资源已清理")
+            
         except Exception as e:
             logger.error(f"清理资源时出错: {e}")
+    
+    def __del__(self):
+        """析构函数 - 仅作为备份，不应依赖此方法"""
+        # 尝试清理，但不应该依赖析构函数
+        try:
+            if hasattr(self, 'pipelines') and self.pipelines:
+                logger.warning("警告: 依赖__del__进行资源清理，应显式调用cleanup()")
+                self.cleanup()
+        except:
+            pass  # 在析构时忽略所有错误
 
 
 def save_episode_offline_aligned(episode_path: str, camera_data: List[Dict], robot_data: List[Dict]) -> bool:
@@ -805,8 +878,8 @@ def display_status_offline_aligned(display_data: Dict, episode_num: int, perf_st
 
 def main():
     parser = argparse.ArgumentParser(description="XHand + Franka多模态数据采集")
-    parser.add_argument('--num_cameras', type=int, default=1, choices=[1, 2],
-                       help='使用的相机数量 (默认: 1)')
+    parser.add_argument('--num_cameras', type=int, default=2, choices=[1, 2],
+                       help='使用的相机数量 (默认: 2)')
     parser.add_argument('--data_dir', type=str, default='XhandData_Multimodal',
                        help='数据保存目录 (默认: XhandData_Multimodal)')
     parser.add_argument('--episode_start', type=int, default=None,
@@ -964,10 +1037,10 @@ def main():
     finally:
         collector.stop()
         try:
-            data_collector.stop_collection()
-        except:
-            pass
-        del data_collector
+            # 使用显式的cleanup方法而不是依赖__del__
+            data_collector.cleanup()
+        except Exception as e:
+            logger.error(f"清理数据采集器失败: {e}")
         print("\n多模态采集系统已关闭")
 
 
