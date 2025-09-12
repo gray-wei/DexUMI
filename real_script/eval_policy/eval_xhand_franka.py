@@ -149,6 +149,7 @@ initial_hand_pos = np.array([
     help="Robot action latency",
 )
 @click.option("-eh", "--exec_horizon", type=int, default=8, help="Execution horizon")
+@click.option("-sd", "--session_duration", type=float, default=20.0, help="Session duration in seconds")
 def main(
     frequency,
     model_path,
@@ -157,6 +158,7 @@ def main(
     hand_action_latency,
     robot_action_latency,
     exec_horizon,
+    session_duration,
 ):
     # Initialize HTTP clients for robot and hand control
     robot_client = HTTPRobotClient(base_url="http://127.0.0.1:5000")
@@ -186,7 +188,7 @@ def main(
     
     # Main control loop
     while True:
-        print("Ready! Starting 20-second inference session...")
+        print(f"Ready! Starting {session_duration}-second inference session...")
             
         # Reset robot to initial position
         print("Moving robot to initial position...")
@@ -227,15 +229,27 @@ def main(
             model_path=model_path,
             ckpt=ckpt,
         )
+        
+        # Check model configuration for input modalities
+        print("\n" + "="*50)
+        print("MODEL CONFIGURATION:")
+        print(f"  Model path: {model_path}")
+        print(f"  Checkpoint: {ckpt}")
+        skip_proprioception = getattr(policy.model_cfg.dataset, 'skip_proprioception', False)
+        enable_fsr = getattr(policy.model_cfg.dataset, 'enable_fsr', False)
+        print(f"  Skip proprioception: {skip_proprioception}")
+        print(f"  Enable FSR: {enable_fsr}")
+        print(f"  Global cond dim: {policy.model_cfg.model.diffusion_policy_head.global_cond_dim}")
+        print("="*50 + "\n")
 
         # Calculate inference parameters
         inference_iter_time = exec_horizon * dt
         inference_fps = 1 / inference_iter_time
         print("inference_fps", inference_fps)
         
-        # Start 20-second inference session
+        # Start inference session
         session_start_time = time.time()
-        session_duration = 20.0  # 20 seconds
+        # session_duration is now passed as parameter
         
         # Initialize video recording storage
         video_frames = []
@@ -259,6 +273,10 @@ def main(
         video_thread.daemon = True
         video_thread.start()
         
+        # Initialize inference reference tracking
+        inference_start_pose = None
+        inference_start_T = None
+        
         # Policy execution loop (runs at inference_fps)
         while time.time() - session_start_time < session_duration:
                 with FrameRateContext(frame_rate=inference_fps):
@@ -272,7 +290,8 @@ def main(
                     # Note: real_policy.py will handle all image preprocessing
                     # The image should be in BGR format to match training data
                     print(f"Time remaining: {session_duration - (time.time() - session_start_time):.1f}s")
-                    if policy.model_cfg.dataset.enable_fsr:
+                    enable_fsr = getattr(policy.model_cfg.dataset, 'enable_fsr', False)
+                    if enable_fsr:
                         print("Using FSR")
                         fsr_raw_obs = dexhand_client.get_tactile(calc=True)
                         print("raw", fsr_raw_obs)
@@ -326,29 +345,33 @@ def main(
                         print(f"FSR obs shape: {np.array(list(fsr_obs)).shape}")
                         print(f"FSR obs values: {np.array(list(fsr_obs))[-1]}")  # Last FSR reading
                     
-                    # Get robot proprioception data for model input
-                    robot_state = robot_client.get_state()
+                    # Get robot proprioception data for model input (only if model uses it)
                     proprioception = None
+                    skip_proprioception = getattr(policy.model_cfg.dataset, 'skip_proprioception', False)
                     
-                    if robot_state and "state" in robot_state:
-                        # Extract joint positions and velocities
-                        joint_q = np.array(robot_state["state"]["ActualQ"])  # 7D joint positions
-                        joint_dq = np.array(robot_state["state"]["ActualQd"])  # 7D joint velocities
-                        # Create 14D proprioception vector: [joint_q, joint_dq]
-                        proprioception = np.concatenate([joint_q, joint_dq]).astype(np.float32)
-                        
-                        print(f"Proprioception shape: {proprioception.shape}")
-                        print(f"Joint positions: {joint_q}")
-                        print(f"Joint velocities: {joint_dq}")
+                    if not skip_proprioception:
+                        robot_state = robot_client.get_state()
+                        if robot_state and "state" in robot_state:
+                            # Extract joint positions and velocities
+                            joint_q = np.array(robot_state["state"]["ActualQ"])  # 7D joint positions
+                            joint_dq = np.array(robot_state["state"]["ActualQd"])  # 7D joint velocities
+                            # Create 14D proprioception vector: [joint_q, joint_dq]
+                            proprioception = np.concatenate([joint_q, joint_dq]).astype(np.float32)
+                            
+                            print(f"Proprioception shape: {proprioception.shape}")
+                            print(f"Joint positions: {joint_q}")
+                            print(f"Joint velocities: {joint_dq}")
+                        else:
+                            # Fallback to zeros if state unavailable
+                            proprioception = np.zeros(14, dtype=np.float32)
+                            print("Warning: Robot state unavailable, using zero proprioception")
                     else:
-                        # Fallback to zeros if state unavailable
-                        proprioception = np.zeros(14, dtype=np.float32)
-                        print("Warning: Robot state unavailable, using zero proprioception")
+                        print("Skipping proprioception (vision-only model)")
 
                     action = policy.predict_action(
                         proprioception[None, ...] if proprioception is not None else None,  # Add batch dimension
                         np.array(list(fsr_obs)).astype(np.float32)
-                        if policy.model_cfg.dataset.enable_fsr
+                        if enable_fsr
                         else None,
                         obs_frame_rgb[None, ...],  # Use original image, let real_policy.py handle preprocessing
                     )
@@ -357,6 +380,13 @@ def main(
                     print(f"Action shape: {action.shape}")
                     print(f"Action min/max: [{action.min():.4f}, {action.max():.4f}]")
                     print(f"Action mean/std: [mean={action.mean():.4f}, std={action.std():.4f}]")
+                    print(f"Action first row: {action[0]}")
+                    
+                    # Check if actions are near zero (potential inference issue)
+                    action_magnitude = np.linalg.norm(action, axis=1).mean()
+                    print(f"Average action magnitude: {action_magnitude:.6f}")
+                    if action_magnitude < 0.001:
+                        print("⚠️ WARNING: Actions are near zero! Model may not be generating proper outputs.")
                     
                     # convert to abs action
                     relative_pose = action[:, :6]
@@ -401,12 +431,9 @@ def main(
 
                         hand_action += offset
 
-                    # Fix the first joint to initial position
-                    hand_action[:, 0] = 1.516937255859375
-                    print(f"Fixed first joint to: {1.516937255859375}")
-
-                    # hand_action[:, 0] = 0.156546025276184082
-                    # print(f"Fixed first joint to: {0.156546025276184082}")
+                    # Fix the first joint to specified position during inference
+                    # hand_action[:, 0] = 0.5154829025268555
+                    # print(f"Fixed first joint to: {0.5154829025268555}")
 
                     # get the robot pose when images were captured
                     robot_frames = robot_client.get_state_history()
@@ -471,18 +498,28 @@ def main(
                     ).as_matrix()
                     T_BE[:3, -1] = ee_aligned_pose[:3]
                     
-                    # Calculate target poses - SIMPLIFIED without T_ET
-                    # Since we're directly in end-effector frame, just apply relative transform
+                    # Set inference start reference frame (only on first iteration)
+                    if inference_start_pose is None:
+                        inference_start_pose = ee_aligned_pose.copy()
+                        inference_start_T = T_BE.copy()
+                        print(f"🎯 INFERENCE START POSE: {inference_start_pose[:3]} (position)")
+                        print(f"🎯 INFERENCE START ROTVEC: {inference_start_pose[3:]} (rotation)")
+                    
+                    # Calculate target poses - FIXED coordinate reference
+                    # Model predicts relative to SEQUENCE START, not current frame
                     T_BN = np.zeros_like(relative_pose)
                     for iter_idx in range(len(relative_pose)):
-                        # Direct application: T_BN = T_BE @ relative_pose
-                        T_BN[iter_idx] = T_BE @ relative_pose[iter_idx]
+                        # CORRECT: Apply relative transform to inference start position
+                        T_BN[iter_idx] = inference_start_T @ relative_pose[iter_idx]
                     
                     # ============ DEBUG: Target Poses ============
                     print("\nDEBUG: Target Transformation")
-                    print(f"Current EE pose: {ee_aligned_pose[:3]}")  # Current position
-                    print(f"First target pose: {T_BN[0, :3, -1]}")  # First target position
-                    print(f"Position change: {T_BN[0, :3, -1] - ee_aligned_pose[:3]}")  # Delta position
+                    print(f"🔄 Current EE pose: {ee_aligned_pose[:3]}")  # Current position
+                    print(f"📍 Inference start pose: {inference_start_pose[:3]}")  # Reference position
+                    print(f"🎯 First target pose: {T_BN[0, :3, -1]}")  # First target position
+                    print(f"📊 Target relative to start: {T_BN[0, :3, -1] - inference_start_pose[:3]}")  # Relative to start
+                    print(f"📈 Target relative to current: {T_BN[0, :3, -1] - ee_aligned_pose[:3]}")  # Relative to current
+                    print(f"📏 Target trajectory span: {np.linalg.norm(T_BN[-1, :3, -1] - T_BN[0, :3, -1]):.4f}m")  # Trajectory span
                     # ============ DEBUG END ============
                     # discard actions which in the past
                     n_action = T_BN.shape[0]
@@ -523,15 +560,25 @@ def main(
                         hand_scheduled += 1
 
                     print(
-                        f"Scheduled actions: {robot_scheduled} robot waypoints, {hand_scheduled} hand waypoints"
+                        f"✅ Scheduled actions: {robot_scheduled} robot waypoints, {hand_scheduled} hand waypoints"
                     )
+                    
+                    # ============ EXECUTION VERIFICATION ============
+                    if robot_scheduled > 0:
+                        scheduled_targets = [T_BN[k, :3, -1] for k in np.where(valid_robot_idx)[0]]
+                        if scheduled_targets:
+                            print(f"🎯 First scheduled target: {scheduled_targets[0]}")
+                            print(f"📏 Distance to first target: {np.linalg.norm(scheduled_targets[0] - ee_aligned_pose[:3]):.4f}m")
+                    else:
+                        print(f"⚠️ WARNING: No robot actions scheduled! Check timing parameters.")
+                    # ============ EXECUTION VERIFICATION END ============
                     if len(hand_action) > exec_horizon + 1:
                         virtual_hand_pos = hand_action[exec_horizon + 1]
                     else:
                         virtual_hand_pos = hand_action[-1]
         
         # Session completed, reset to initial positions
-        print("20-second session completed. Resetting to initial positions...")
+        print(f"{session_duration}-second session completed. Resetting to initial positions...")
         
         # Stop video recording thread
         video_recording_active.clear()
@@ -539,6 +586,9 @@ def main(
         
         # Save video offline (does not affect real-time performance)
         video_save_dir = "/home/ubuntu/hgw/IL/DexUMI/data/video"
+        print(f"\nVideo Recording Summary:")
+        print(f"  Frames captured: {len(video_frames)}")
+        print(f"  Duration: {video_timestamps[-1] - video_timestamps[0]:.1f}s" if video_timestamps else "0s")
         save_video_offline(video_frames, video_timestamps, video_save_dir, session_start_time)
         
         # Reset robot to initial position

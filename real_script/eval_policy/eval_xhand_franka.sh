@@ -6,13 +6,17 @@
 source ~/anaconda3/etc/profile.d/conda.sh
 conda activate dexumi
 
+# Set Python path for dexumi module
+export PYTHONPATH="/home/ubuntu/hgw/IL/DexUMI:$PYTHONPATH"
+
 # Path to your trained model
-MODEL_PATH="/home/ubuntu/hgw/IL/DexUMI/data/weight/vision_tactile_propio"  # TODO: Update this path
-CHECKPOINT=600
+MODEL_PATH="/home/ubuntu/hgw/IL/DexUMI/data/weight/vision_only_0909"
+CHECKPOINT=100
 
 # Control parameters
-FREQUENCY=15  # Control frequency in Hz
+FREQUENCY=20  # Control frequency in Hz
 EXEC_HORIZON=8  # Number of action steps to execute before re-predicting
+SESSION_DURATION=120.0  # Session duration in seconds
 
 # Visualization settings
 ENABLE_VISUALIZATION=false  # Set to true to enable real-time camera visualization
@@ -37,6 +41,7 @@ echo "Checkpoint: $CHECKPOINT"
 echo "Camera Type: $CAMERA_TYPE"
 echo "Frequency: $FREQUENCY Hz"
 echo "Execution Horizon: $EXEC_HORIZON steps"
+echo "Session Duration: $SESSION_DURATION seconds"
 echo ""
 echo "Latency Settings:"
 echo "  Camera: ${CAMERA_LATENCY}s"
@@ -50,15 +55,18 @@ echo "✓ HTTP control interface"
 echo "✓ RealSense/OAK camera support"
 echo "✓ Multi-step action execution"
 echo ""
-echo "Make sure the robot server is running:"
-echo "  python franka_server.py"
+echo "Note: Robot server will be checked during runtime"
 echo ""
-echo "Press Ctrl+C to abort, or wait 3 seconds to continue..."
+echo "Starting in 3 seconds... (Press Ctrl+C to abort)"
 echo "========================================="
 echo ""
 
-# Wait for user to check
-sleep 3
+# Countdown
+for i in 3 2 1; do
+    echo -n "$i... "
+    sleep 1
+done
+echo "Starting!"
 
 # Run the evaluation script
 python real_script/eval_policy/eval_xhand_franka.py \
@@ -66,6 +74,7 @@ python real_script/eval_policy/eval_xhand_franka.py \
     --ckpt $CHECKPOINT \
     --frequency $FREQUENCY \
     --exec_horizon $EXEC_HORIZON \
+    --session_duration $SESSION_DURATION \
     --camera_latency $CAMERA_LATENCY \
     --hand_action_latency $HAND_ACTION_LATENCY \
     --robot_action_latency $ROBOT_ACTION_LATENCY
