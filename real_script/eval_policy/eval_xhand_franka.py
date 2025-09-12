@@ -1,5 +1,7 @@
+import os
 import time
 from collections import deque
+from datetime import datetime
 
 import click
 import cv2
@@ -41,6 +43,61 @@ def compute_total_force_per_finger(all_fsr_observations):
     return total_force
 
 
+def save_video_offline(frames, timestamps, save_dir, session_start_time):
+    """
+    Save collected frames as video file offline after inference session.
+    
+    Parameters:
+    frames (list): List of RGB frames (numpy arrays)
+    timestamps (list): List of timestamps for each frame
+    save_dir (str): Directory to save the video file
+    session_start_time (float): Start time of the session for filename generation
+    """
+    if not frames:
+        print("No frames to save")
+        return
+    
+    # Create save directory if not exists
+    os.makedirs(save_dir, exist_ok=True)
+    
+    # Generate unique filename based on session start time
+    timestamp_str = datetime.fromtimestamp(session_start_time).strftime("%Y%m%d_%H%M%S")
+    filename = f"inference_session_{timestamp_str}.mp4"
+    filepath = os.path.join(save_dir, filename)
+    
+    # Video parameters
+    height, width, channels = frames[0].shape
+    
+    # Calculate FPS from actual timestamps
+    if len(timestamps) > 1:
+        duration = timestamps[-1] - timestamps[0]
+        fps = (len(frames) - 1) / duration if duration > 0 else 30.0
+    else:
+        fps = 30.0
+    
+    # Ensure reasonable FPS range
+    fps = max(10.0, min(fps, 60.0))
+    
+    print(f"Saving video with {len(frames)} frames at {fps:.1f} FPS to: {filepath}")
+    
+    # Initialize VideoWriter
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    out = cv2.VideoWriter(filepath, fourcc, fps, (width, height))
+    
+    if not out.isOpened():
+        print(f"Error: Could not open VideoWriter for {filepath}")
+        return
+    
+    # Write frames
+    for frame in frames:
+        # obs_frame.rgb is actually BGR format (despite the name)
+        # No color conversion needed - save directly
+        out.write(frame)
+    
+    out.release()
+    print(f"Video saved successfully: {filepath}")
+
+
 # Fixed initial positions (consistent with data collection)
 # Initial robot pose from XhandMultimodalCollection.py (7D: xyz + quaternion)
 initial_robot_pose = np.array([
@@ -54,7 +111,8 @@ binary_cutoff = [10, 10, 10]
 
 # Initial hand position (open position) - Updated to match open_gripper command
 initial_hand_pos = np.array([
-    1.516937255859375,
+    # 1.516937255859375,
+    0.156546025276184082,
     0.5177657604217529,
     0.04799513891339302,
     0.01787799410521984,
@@ -179,11 +237,35 @@ def main(
         session_start_time = time.time()
         session_duration = 20.0  # 20 seconds
         
-        # Policy execution loop
+        # Initialize video recording storage
+        video_frames = []
+        video_timestamps = []
+        
+        # Video recording at full camera FPS (30fps) - independent of inference
+        import threading
+        video_recording_active = threading.Event()
+        video_recording_active.set()
+        
+        def video_recording_thread():
+            while video_recording_active.is_set() and (time.time() - session_start_time < session_duration):
+                frame = obs_camera.get_camera_frame()
+                if frame is not None:
+                    video_frames.append(frame.rgb.copy())
+                    video_timestamps.append(time.time())
+                time.sleep(1/30)  # 30 FPS for video recording
+        
+        # Start video recording in background
+        video_thread = threading.Thread(target=video_recording_thread)
+        video_thread.daemon = True
+        video_thread.start()
+        
+        # Policy execution loop (runs at inference_fps)
         while time.time() - session_start_time < session_duration:
                 with FrameRateContext(frame_rate=inference_fps):
-                    # Get observation from camera
+                    # Get observation from camera for inference
                     obs_frame = obs_camera.get_camera_frame()
+                    if obs_frame is None:
+                        continue
                     obs_frame_recieved_time = obs_frame.receive_time
                     obs_frame_rgb = obs_frame.rgb.copy()
                     
@@ -319,6 +401,13 @@ def main(
 
                         hand_action += offset
 
+                    # Fix the first joint to initial position
+                    hand_action[:, 0] = 1.516937255859375
+                    print(f"Fixed first joint to: {1.516937255859375}")
+
+                    # hand_action[:, 0] = 0.156546025276184082
+                    # print(f"Fixed first joint to: {0.156546025276184082}")
+
                     # get the robot pose when images were captured
                     robot_frames = robot_client.get_state_history()
                     robot_timestamp = []
@@ -443,6 +532,14 @@ def main(
         
         # Session completed, reset to initial positions
         print("20-second session completed. Resetting to initial positions...")
+        
+        # Stop video recording thread
+        video_recording_active.clear()
+        video_thread.join(timeout=2)  # Wait up to 2 seconds for thread to finish
+        
+        # Save video offline (does not affect real-time performance)
+        video_save_dir = "/home/ubuntu/hgw/IL/DexUMI/data/video"
+        save_video_offline(video_frames, video_timestamps, video_save_dir, session_start_time)
         
         # Reset robot to initial position
         initial_pose_6d = np.zeros(6)
