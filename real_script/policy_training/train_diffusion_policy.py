@@ -120,7 +120,7 @@ def train_diffusion_policy(cfg: DictConfig):
         for batch in dataloader:
             with accelerator.accumulate(model):
                 (visual_observation, actions, fsr, proprioception) = (
-                    batch["camera_0"].to(accelerator.device),
+                    batch["camera_1"].to(accelerator.device),
                     batch["action"].to(accelerator.device),
                     batch["fsr"].to(accelerator.device) if "fsr" in batch else None,
                     batch["proprioception"].to(accelerator.device)

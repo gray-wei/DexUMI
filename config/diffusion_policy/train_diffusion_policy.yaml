@@ -57,18 +57,18 @@ num_warmup_steps: 500
 dataset:
   _target_: dexumi.diffusion_policy.dataloader.dexumi_dataset.DexUMIDataset
   data_dirs: [
-    "/home/ubuntu/hgw/IL/DexUMI/data/xhand_dataset_aligned.zarr",
+    "/home/guowei/data/dataset_0909_camera1.zarr",
   ]
-  load_camera_ids: [0]
+  load_camera_ids: [1]
   camera_resize_shape: [240,240]
   pred_horizon: 16
   obs_horizon: 1
   action_horizon: 8
-  unnormal_list: ["camera_0","pose"]
+  unnormal_list: ["camera_1","pose"]
   optional_transforms: ["Resize","RandomCrop","ColorJitter","RandomGrayscale","GaussianBlur"]
   relative_hand_action: False
-  skip_proprioception: False
-  enable_fsr: True
+  skip_proprioception: True # skip?
+  enable_fsr: False # use fsr?
   bgr2rgb: True
   max_episode: null
   fsr_binary_cutoff: [10,10,10] #xhand 
@@ -83,4 +83,4 @@ model:
   diffusion_policy_head:
     _target_: dexumi.diffusion_policy.model.diffusion_model.ConditionalUnet1D
     input_dim: ${action_dim}
-    global_cond_dim: 401
+    global_cond_dim: 384 # 384 + 14 + 3
