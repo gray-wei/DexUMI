@@ -14,6 +14,33 @@ from dexumi.common.utility.matrix import (
     homogeneous_matrix_to_6dof,
     vec6dof_to_homogeneous_matrix,
 )
+
+def euler_to_homogeneous_matrix(translation, euler_angles):
+    """
+    Construct a 4x4 homogeneous transformation matrix from translation and Euler angles.
+
+    Args:
+        translation: A 3-element array [x, y, z]
+        euler_angles: A 3-element array [roll, pitch, yaw] in radians
+
+    Returns:
+        A 4x4 homogeneous transformation matrix
+    """
+    # Convert Euler angles to rotation vector
+    rotvec = st.Rotation.from_euler('xyz', euler_angles).as_rotvec()
+    return vec6dof_to_homogeneous_matrix(translation, rotvec)
+
+def homogeneous_matrix_to_6dof_euler(homogeneous_matrix):
+    """
+    Convert a 4x4 homogeneous transformation matrix to 6-DOF with Euler angles.
+
+    Returns:
+        A 6-element vector [x, y, z, roll, pitch, yaw]
+    """
+    translation = homogeneous_matrix[:3, 3]
+    rotation = homogeneous_matrix[:3, :3]
+    euler = st.Rotation.from_matrix(rotation).as_euler('xyz')
+    return np.concatenate((translation, euler))
 from dexumi.constants import (
     XHAND_HAND_MOTOR_SCALE_FACTOR,
 )
@@ -167,7 +194,7 @@ def main(
     if len(all_cameras) < 1:
         print("Warning: No RealSense cameras found. Exiting...")
         return
-    
+
     # Use the first available camera for observation
     # Match training format exactly: 424x240 BGR -> center crop to 240x240 (same as XhandMultimodalCollection.py)
     obs_camera = RealSenseCamera(
@@ -190,7 +217,7 @@ def main(
             
         # Reset robot to initial position
         print("Moving robot to initial position...")
-        # Convert initial pose from 7D (xyz + quat) to 6D (xyz + rotvec) for compatibility
+        # Convert initial pose from 7D (xyz + quat) to 6D (xyz + rotvec) for robot control
         initial_pose_6d = np.zeros(6)
         initial_pose_6d[:3] = initial_robot_pose[:3]
         initial_pose_6d[3:] = st.Rotation.from_quat(initial_robot_pose[3:]).as_rotvec()
@@ -271,6 +298,8 @@ def main(
                     
                     # Note: real_policy.py will handle all image preprocessing
                     # The image should be in BGR format to match training data
+                    
+                    
                     print(f"Time remaining: {session_duration - (time.time() - session_start_time):.1f}s")
                     if policy.model_cfg.dataset.enable_fsr:
                         print("Using FSR")
@@ -369,9 +398,11 @@ def main(
                     print(f"Relative rotation norm: {np.linalg.norm(relative_pose[0][3:]):.4f}")  # Rotation magnitude
                     # ============ DEBUG SECTION END ============
                     
+                    # Convert relative poses from Euler angles to homogeneous matrices
+                    # The model outputs 6D actions: [x, y, z, roll, pitch, yaw]
                     relative_pose = np.array(
                         [
-                            vec6dof_to_homogeneous_matrix(rp[:3], rp[3:])
+                            euler_to_homogeneous_matrix(rp[:3], rp[3:])
                             for rp in relative_pose
                         ]
                     )
@@ -401,12 +432,6 @@ def main(
 
                         hand_action += offset
 
-                    # Fix the first joint to initial position
-                    hand_action[:, 0] = 1.516937255859375
-                    print(f"Fixed first joint to: {1.516937255859375}")
-
-                    # hand_action[:, 0] = 0.156546025276184082
-                    # print(f"Fixed first joint to: {0.156546025276184082}")
 
                     # get the robot pose when images were captured
                     robot_frames = robot_client.get_state_history()
@@ -417,13 +442,14 @@ def main(
                         # HTTP client returns 7D pose (xyz + quaternion)
                         tcp_pose = rf["state"]["ActualTCPPose"]
                         xyz = tcp_pose[:3]
-                        # Convert quaternion to rotation vector for homogeneous matrix
+                        # Convert quaternion to euler angles to match training format
                         if len(tcp_pose) == 7:
-                            rotvec = st.Rotation.from_quat(tcp_pose[3:]).as_rotvec()
+                            euler = st.Rotation.from_quat(tcp_pose[3:]).as_euler('xyz')
                         else:
-                            rotvec = tcp_pose[3:]  # Already in rotvec format
+                            # If already in rotvec format, convert to euler
+                            euler = st.Rotation.from_rotvec(tcp_pose[3:]).as_euler('xyz')
                         robot_homogeneous_matrix.append(
-                            vec6dof_to_homogeneous_matrix(xyz, rotvec)
+                            euler_to_homogeneous_matrix(xyz, euler)
                         )
                     robot_timestamp = np.array(robot_timestamp)
                     robot_homogeneous_matrix = np.array(robot_homogeneous_matrix)
@@ -444,11 +470,12 @@ def main(
                         tcp_pose = current_state["state"]["ActualTCPPose"]
                         xyz = tcp_pose[:3]
                         if len(tcp_pose) == 7:
-                            rotvec = st.Rotation.from_quat(tcp_pose[3:]).as_rotvec()
+                            euler = st.Rotation.from_quat(tcp_pose[3:]).as_euler('xyz')
                         else:
-                            rotvec = tcp_pose[3:]
-                        aligned_pose_matrix = vec6dof_to_homogeneous_matrix(xyz, rotvec)
-                        aligned_pose = homogeneous_matrix_to_6dof(aligned_pose_matrix)
+                            # If already in rotvec format, convert to euler
+                            euler = st.Rotation.from_rotvec(tcp_pose[3:]).as_euler('xyz')
+                        aligned_pose_matrix = euler_to_homogeneous_matrix(xyz, euler)
+                        aligned_pose = homogeneous_matrix_to_6dof_euler(aligned_pose_matrix)
                     else:
                         # Interpolate to get pose at inference time
                         try:
@@ -457,17 +484,17 @@ def main(
                                 homogeneous_matrix=robot_homogeneous_matrix,
                             )
                             aligned_pose_matrix = robot_pose_interpolator([t_actual_inference])[0]
-                            aligned_pose = homogeneous_matrix_to_6dof(aligned_pose_matrix)
+                            aligned_pose = homogeneous_matrix_to_6dof_euler(aligned_pose_matrix)
                         except ValueError as e:
                             print(f"Interpolation failed: {e}, using most recent state")
                             # Fallback to most recent state
-                            aligned_pose = homogeneous_matrix_to_6dof(robot_homogeneous_matrix[-1])
+                            aligned_pose = homogeneous_matrix_to_6dof_euler(robot_homogeneous_matrix[-1])
                     ee_aligned_pose = aligned_pose
                     
                     # Build current end-effector transformation matrix T_BE
                     T_BE = np.eye(4)
-                    T_BE[:3, :3] = st.Rotation.from_rotvec(
-                        ee_aligned_pose[3:]
+                    T_BE[:3, :3] = st.Rotation.from_euler(
+                        'xyz', ee_aligned_pose[3:]
                     ).as_matrix()
                     T_BE[:3, -1] = ee_aligned_pose[:3]
                     
@@ -505,6 +532,13 @@ def main(
                     for k in np.where(valid_robot_idx)[0]:
                         target_pose = np.zeros(6)
                         target_pose[:3] = T_BN[k, :3, -1]
+                        
+                        # Limit z coordinate to minimum value of 0.19
+                        min_z = 0.19
+                        if target_pose[2] < min_z:
+                            print(f"Z coordinate {target_pose[2]:.4f} is below minimum {min_z}, clamping to {min_z}")
+                            target_pose[2] = min_z
+                        
                         target_pose[3:] = st.Rotation.from_matrix(
                             T_BN[k, :3, :3]
                         ).as_rotvec()

@@ -7,11 +7,11 @@ source ~/anaconda3/etc/profile.d/conda.sh
 conda activate dexumi
 
 # Path to your trained model
-MODEL_PATH="/home/ubuntu/hgw/IL/DexUMI/data/weight/vision_tactile_propio"  # TODO: Update this path
-CHECKPOINT=600
+MODEL_PATH="/home/ubuntu/hgw/IL/DexUMI/data/weight/vision_tactile_proprio_0909_0917"  # TODO: Update this path
+CHECKPOINT=90
 
 # Control parameters
-FREQUENCY=15  # Control frequency in Hz
+FREQUENCY=20  # Control frequency in Hz
 EXEC_HORIZON=8  # Number of action steps to execute before re-predicting
 
 # Visualization settings
