@@ -15,32 +15,6 @@ from dexumi.common.utility.matrix import (
     vec6dof_to_homogeneous_matrix,
 )
 
-def euler_to_homogeneous_matrix(translation, euler_angles):
-    """
-    Construct a 4x4 homogeneous transformation matrix from translation and Euler angles.
-
-    Args:
-        translation: A 3-element array [x, y, z]
-        euler_angles: A 3-element array [roll, pitch, yaw] in radians
-
-    Returns:
-        A 4x4 homogeneous transformation matrix
-    """
-    # Convert Euler angles to rotation vector
-    rotvec = st.Rotation.from_euler('xyz', euler_angles).as_rotvec()
-    return vec6dof_to_homogeneous_matrix(translation, rotvec)
-
-def homogeneous_matrix_to_6dof_euler(homogeneous_matrix):
-    """
-    Convert a 4x4 homogeneous transformation matrix to 6-DOF with Euler angles.
-
-    Returns:
-        A 6-element vector [x, y, z, roll, pitch, yaw]
-    """
-    translation = homogeneous_matrix[:3, 3]
-    rotation = homogeneous_matrix[:3, :3]
-    euler = st.Rotation.from_matrix(rotation).as_euler('xyz')
-    return np.concatenate((translation, euler))
 from dexumi.constants import (
     XHAND_HAND_MOTOR_SCALE_FACTOR,
 )
@@ -298,8 +272,9 @@ def main(
 
                     # ============ IMAGE PREPROCESSING TO MATCH TRAINING ============
                     # Training pipeline: 424×240 → 240×240 → 193×238 → resize to 240×240 → RandomCrop to 224×224
-                    # Step 1: Convert RGB to BGR to match training data format
-                    obs_frame_bgr = cv2.cvtColor(obs_frame_rgb, cv2.COLOR_RGB2BGR)
+                    # RealSense camera outputs BGR format (despite variable name 'rgb')
+                    # No conversion needed - pass BGR directly to real_policy.py
+                    obs_frame_bgr = obs_frame_rgb  # Actually BGR data from RealSense camera
 
                     # Step 2: Top-left crop to 193×238 (matching crop_rgb_images.py)
                     if obs_frame_bgr.shape[:2] == (240, 240):
@@ -310,7 +285,7 @@ def main(
                         print(f"Warning: Expected 240×240 image, got {obs_frame_bgr.shape}")
                         obs_frame_cropped = obs_frame_bgr
 
-                    # Step 3: real_policy.py will handle resize to 240×240 and RandomCrop to 224×224
+                    # Step 3: real_policy.py will handle BGR→RGB conversion, resize to 240×240 and CenterCrop to 224×224
                     
                     
                     print(f"Time remaining: {session_duration - (time.time() - session_start_time):.1f}s")
@@ -362,9 +337,9 @@ def main(
                     # ============ DEBUG SECTION START ============
                     print("\n" + "="*50)
                     print("DEBUG: Input Information")
-                    print(f"Original RGB image shape: {obs_frame_rgb.shape}")
-                    print(f"Processed BGR image shape: {obs_frame_cropped.shape}, dtype: {obs_frame_cropped.dtype}")
-                    print(f"Processed image range: [{obs_frame_cropped.min():.2f}, {obs_frame_cropped.max():.2f}]")
+                    print(f"RealSense camera image shape: {obs_frame_rgb.shape} (actually BGR despite variable name)")
+                    print(f"Cropped BGR image shape: {obs_frame_cropped.shape}, dtype: {obs_frame_cropped.dtype}")
+                    print(f"Cropped image range: [{obs_frame_cropped.min():.2f}, {obs_frame_cropped.max():.2f}]")
                     if policy.model_cfg.dataset.enable_fsr:
                         print(f"FSR obs shape: {np.array(list(fsr_obs)).shape}")
                         print(f"FSR obs values: {np.array(list(fsr_obs))[-1]}")  # Last FSR reading
@@ -393,7 +368,7 @@ def main(
                         np.array(list(fsr_obs)).astype(np.float32)
                         if policy.model_cfg.dataset.enable_fsr
                         else None,
-                        obs_frame_cropped[None, ...],  # Use preprocessed image (193×238 BGR)
+                        obs_frame_cropped[None, ...],  # Use cropped BGR image (193×238, will be converted to RGB in real_policy.py)
                     )
                     
                     print("\nDEBUG: Raw Action Output")
@@ -412,11 +387,11 @@ def main(
                     print(f"Relative rotation norm: {np.linalg.norm(relative_pose[0][3:]):.4f}")  # Rotation magnitude
                     # ============ DEBUG SECTION END ============
                     
-                    # Convert relative poses from Euler angles to homogeneous matrices
-                    # The model outputs 6D actions: [x, y, z, roll, pitch, yaw]
+                    # Convert relative poses from rotation vector to homogeneous matrices
+                    # The model outputs 6D actions: [x, y, z, rx, ry, rz] (rotation vector)
                     relative_pose = np.array(
                         [
-                            euler_to_homogeneous_matrix(rp[:3], rp[3:])
+                            vec6dof_to_homogeneous_matrix(rp[:3], rp[3:])
                             for rp in relative_pose
                         ]
                     )
@@ -456,15 +431,19 @@ def main(
                         # HTTP client returns 7D pose (xyz + quaternion)
                         tcp_pose = rf["state"]["ActualTCPPose"]
                         xyz = tcp_pose[:3]
-                        # Convert quaternion to euler angles to match training format
+                        # Convert directly from quaternion to homogeneous matrix
                         if len(tcp_pose) == 7:
-                            euler = st.Rotation.from_quat(tcp_pose[3:]).as_euler('xyz')
+                            quat = tcp_pose[3:]  # quaternion (x,y,z,w)
+                            rotation_matrix = st.Rotation.from_quat(quat).as_matrix()
                         else:
-                            # If already in rotvec format, convert to euler
-                            euler = st.Rotation.from_rotvec(tcp_pose[3:]).as_euler('xyz')
-                        robot_homogeneous_matrix.append(
-                            euler_to_homogeneous_matrix(xyz, euler)
-                        )
+                            # If already in rotvec format
+                            rotvec = tcp_pose[3:]
+                            rotation_matrix = st.Rotation.from_rotvec(rotvec).as_matrix()
+
+                        transform_matrix = np.eye(4)
+                        transform_matrix[:3, :3] = rotation_matrix
+                        transform_matrix[:3, 3] = xyz
+                        robot_homogeneous_matrix.append(transform_matrix)
                     robot_timestamp = np.array(robot_timestamp)
                     robot_homogeneous_matrix = np.array(robot_homogeneous_matrix)
                     
@@ -484,12 +463,17 @@ def main(
                         tcp_pose = current_state["state"]["ActualTCPPose"]
                         xyz = tcp_pose[:3]
                         if len(tcp_pose) == 7:
-                            euler = st.Rotation.from_quat(tcp_pose[3:]).as_euler('xyz')
+                            quat = tcp_pose[3:]  # quaternion (x,y,z,w)
+                            rotation_matrix = st.Rotation.from_quat(quat).as_matrix()
                         else:
-                            # If already in rotvec format, convert to euler
-                            euler = st.Rotation.from_rotvec(tcp_pose[3:]).as_euler('xyz')
-                        aligned_pose_matrix = euler_to_homogeneous_matrix(xyz, euler)
-                        aligned_pose = homogeneous_matrix_to_6dof_euler(aligned_pose_matrix)
+                            # If already in rotvec format
+                            rotvec = tcp_pose[3:]
+                            rotation_matrix = st.Rotation.from_rotvec(rotvec).as_matrix()
+
+                        aligned_pose_matrix = np.eye(4)
+                        aligned_pose_matrix[:3, :3] = rotation_matrix
+                        aligned_pose_matrix[:3, 3] = xyz
+                        aligned_pose = homogeneous_matrix_to_6dof(aligned_pose_matrix)
                     else:
                         # Interpolate to get pose at inference time
                         try:
@@ -498,17 +482,17 @@ def main(
                                 homogeneous_matrix=robot_homogeneous_matrix,
                             )
                             aligned_pose_matrix = robot_pose_interpolator([t_actual_inference])[0]
-                            aligned_pose = homogeneous_matrix_to_6dof_euler(aligned_pose_matrix)
+                            aligned_pose = homogeneous_matrix_to_6dof(aligned_pose_matrix)
                         except ValueError as e:
                             print(f"Interpolation failed: {e}, using most recent state")
                             # Fallback to most recent state
-                            aligned_pose = homogeneous_matrix_to_6dof_euler(robot_homogeneous_matrix[-1])
+                            aligned_pose = homogeneous_matrix_to_6dof(robot_homogeneous_matrix[-1])
                     ee_aligned_pose = aligned_pose
                     
                     # Build current end-effector transformation matrix T_BE
                     T_BE = np.eye(4)
-                    T_BE[:3, :3] = st.Rotation.from_euler(
-                        'xyz', ee_aligned_pose[3:]
+                    T_BE[:3, :3] = st.Rotation.from_rotvec(
+                        ee_aligned_pose[3:]
                     ).as_matrix()
                     T_BE[:3, -1] = ee_aligned_pose[:3]
                     

@@ -56,7 +56,7 @@ def process_rgb_file(rgb_no_crop_path, rgb_path):
         return False
 
 def main():
-    base_dir = Path("/home/gray/dataset/dexumi/XhandData_Multimodal")
+    base_dir = Path("/home/ubuntu/hgw/IL/DexUMI/data/XhandData_Multimodal_0909")
     
     # Find all rgb_no_crop.pkl files in camera_1 directories
     rgb_no_crop_files = list(base_dir.glob("*/camera_1/rgb_no_crop.pkl"))
