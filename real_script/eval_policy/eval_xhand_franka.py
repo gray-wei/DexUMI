@@ -262,7 +262,7 @@ def main(
         
         # Start 20-second inference session
         session_start_time = time.time()
-        session_duration = 20.0  # 20 seconds
+        session_duration = 50.0  # 20 seconds
         
         # Initialize video recording storage
         video_frames = []
@@ -295,9 +295,22 @@ def main(
                         continue
                     obs_frame_recieved_time = obs_frame.receive_time
                     obs_frame_rgb = obs_frame.rgb.copy()
-                    
-                    # Note: real_policy.py will handle all image preprocessing
-                    # The image should be in BGR format to match training data
+
+                    # ============ IMAGE PREPROCESSING TO MATCH TRAINING ============
+                    # Training pipeline: 424×240 → 240×240 → 193×238 → resize to 240×240 → RandomCrop to 224×224
+                    # Step 1: Convert RGB to BGR to match training data format
+                    obs_frame_bgr = cv2.cvtColor(obs_frame_rgb, cv2.COLOR_RGB2BGR)
+
+                    # Step 2: Top-left crop to 193×238 (matching crop_rgb_images.py)
+                    if obs_frame_bgr.shape[:2] == (240, 240):
+                        # Crop from 240×240 to 193×238 using top-left corner
+                        obs_frame_cropped = obs_frame_bgr[:238, :193, :]  # height=238, width=193
+                        print(f"Image processing: {obs_frame_bgr.shape} → crop to {obs_frame_cropped.shape}")
+                    else:
+                        print(f"Warning: Expected 240×240 image, got {obs_frame_bgr.shape}")
+                        obs_frame_cropped = obs_frame_bgr
+
+                    # Step 3: real_policy.py will handle resize to 240×240 and RandomCrop to 224×224
                     
                     
                     print(f"Time remaining: {session_duration - (time.time() - session_start_time):.1f}s")
@@ -349,8 +362,9 @@ def main(
                     # ============ DEBUG SECTION START ============
                     print("\n" + "="*50)
                     print("DEBUG: Input Information")
-                    print(f"Image shape: {obs_frame_rgb.shape}, dtype: {obs_frame_rgb.dtype}")
-                    print(f"Image range: [{obs_frame_rgb.min():.2f}, {obs_frame_rgb.max():.2f}]")
+                    print(f"Original RGB image shape: {obs_frame_rgb.shape}")
+                    print(f"Processed BGR image shape: {obs_frame_cropped.shape}, dtype: {obs_frame_cropped.dtype}")
+                    print(f"Processed image range: [{obs_frame_cropped.min():.2f}, {obs_frame_cropped.max():.2f}]")
                     if policy.model_cfg.dataset.enable_fsr:
                         print(f"FSR obs shape: {np.array(list(fsr_obs)).shape}")
                         print(f"FSR obs values: {np.array(list(fsr_obs))[-1]}")  # Last FSR reading
@@ -379,7 +393,7 @@ def main(
                         np.array(list(fsr_obs)).astype(np.float32)
                         if policy.model_cfg.dataset.enable_fsr
                         else None,
-                        obs_frame_rgb[None, ...],  # Use original image, let real_policy.py handle preprocessing
+                        obs_frame_cropped[None, ...],  # Use preprocessed image (193×238 BGR)
                     )
                     
                     print("\nDEBUG: Raw Action Output")
