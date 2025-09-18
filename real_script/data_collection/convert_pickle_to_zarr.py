@@ -10,7 +10,7 @@ Input structure (pickle):
         ├── camera_0/
         │   ├── rgb.pkl               # [T, H, W, 3]
         │   └── receive_time.pkl      # [T]
-        ├── pose.pkl                  # [T, 7] (xyz + quaternion)
+        ├── pose.pkl                  # [T, 7] (xyz + quaternion[xyzw])
         ├── hand_action.pkl           # [T, 12]
         ├── proprioception.pkl        # [T, 14]
         ├── fsr.pkl                   # [T, 5, 3]
@@ -19,7 +19,7 @@ Input structure (pickle):
 Output structure (zarr):
     dataset.zarr/
     └── episode_0/
-        ├── pose                      # [T, 6] (xyz + euler angles)
+        ├── pose                      # [T, 6] (xyz + rotation vector)
         ├── hand_action               # [T, 12]
         ├── proprioception           # [T, 14]
         ├── fsr                      # [T, 3] (averaged across fingers)
@@ -126,8 +126,8 @@ def align_multimodal_episode(episode_path: Path, camera_ids: Optional[List[int]]
         pose_data = pickle.load(f)
         positions = pose_data[:, :3]
         quaternions = pose_data[:, 3:7]
-        euler_angles = np.array([quaternion_to_euler(q) for q in quaternions])
-        aligned_pose = np.concatenate([positions, euler_angles], axis=-1).astype(np.float32)
+        rotvec_angles = np.array([quaternion_to_rotvec(q) for q in quaternions])
+        aligned_pose = np.concatenate([positions, rotvec_angles], axis=-1).astype(np.float32)
     
     with open(episode_path / "hand_action.pkl", "rb") as f:
         aligned_hand_action = pickle.load(f).astype(np.float32)
@@ -184,36 +184,36 @@ def align_multimodal_episode(episode_path: Path, camera_ids: Optional[List[int]]
     }
 
 
-def quaternion_to_euler(quat: np.ndarray) -> np.ndarray:
+def quaternion_to_rotvec(quat: np.ndarray) -> np.ndarray:
     """
-    Convert quaternion (w, x, y, z) to Euler angles (roll, pitch, yaw)
-    
+    Convert quaternion (x, y, z, w) to rotation vector (axis-angle representation)
+
     Args:
-        quat: Array of shape (..., 4) with quaternion in (w, x, y, z) format
-    
+        quat: Array of shape (..., 4) with quaternion in (x, y, z, w) format (as from robot API)
+
     Returns:
-        euler: Array of shape (..., 3) with Euler angles in radians
+        rotvec: Array of shape (..., 3) with rotation vector in radians
     """
     # Ensure input is numpy array
     quat = np.asarray(quat)
-    
+
     # Handle both single quaternion and batch
     original_shape = quat.shape
     if quat.ndim == 1:
         quat = quat.reshape(1, -1)
-    
-    # Convert from (w, x, y, z) to (x, y, z, w) for scipy
-    quat_scipy = np.concatenate([quat[..., 1:], quat[..., :1]], axis=-1)
-    
-    # Create rotation object and get euler angles
+
+    # Input is already in (x, y, z, w) format for scipy
+    quat_scipy = quat
+
+    # Create rotation object and get rotation vector
     r = Rotation.from_quat(quat_scipy)
-    euler = r.as_euler('xyz', degrees=False)
-    
+    rotvec = r.as_rotvec()
+
     # Restore original shape
     if len(original_shape) == 1:
-        euler = euler.squeeze(0)
-    
-    return euler
+        rotvec = rotvec.squeeze(0)
+
+    return rotvec
 
 
 def load_pickle_episode(episode_path: Path, multimodal_format: bool = False, camera_ids: Optional[List[int]] = None) -> Dict:
@@ -237,11 +237,11 @@ def load_pickle_episode(episode_path: Path, multimodal_format: bool = False, cam
     # Load core data files
     with open(episode_path / "pose.pkl", "rb") as f:
         pose_data = pickle.load(f)
-        # Convert quaternion (xyz + quat_wxyz) to 6DoF (xyz + euler_xyz)
+        # Convert quaternion (xyz + quat_xyzw) to 6DoF (xyz + rotvec_xyz)
         positions = pose_data[:, :3]  # xyz positions
-        quaternions = pose_data[:, 3:7]  # quaternion (w, x, y, z)
-        euler_angles = np.array([quaternion_to_euler(q) for q in quaternions])
-        data["pose"] = np.concatenate([positions, euler_angles], axis=-1).astype(np.float32)
+        quaternions = pose_data[:, 3:7]  # quaternion (x, y, z, w)
+        rotvec_angles = np.array([quaternion_to_rotvec(q) for q in quaternions])
+        data["pose"] = np.concatenate([positions, rotvec_angles], axis=-1).astype(np.float32)
     
     with open(episode_path / "hand_action.pkl", "rb") as f:
         data["hand_action"] = pickle.load(f).astype(np.float32)
@@ -378,7 +378,7 @@ def create_zarr_dataset(
             episode_group = root.create_group(episode_name, overwrite=True)
             
             # Save core data
-            # Pose: [T, 6] (xyz + euler angles)
+            # Pose: [T, 6] (xyz + rotation vector)
             episode_group.create_dataset(
                 "pose",
                 data=episode_data["pose"],
