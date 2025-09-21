@@ -61,35 +61,12 @@ class RealPolicy:
                 - stats["relative_hand_action"]["min"]
                 > 5e-2
             )
-            # 组合相对姿态和相对手部动作的统计信息
-            self.stats["action"] = {
-                "min": np.concatenate(
-                    [
-                        stats["relative_pose"]["min"],
-                        stats["relative_hand_action"]["min"],
-                    ]
-                ),
-                "max": np.concatenate(
-                    [
-                        stats["relative_pose"]["max"],
-                        stats["relative_hand_action"]["max"],
-                    ]
-                ),
-            }
         else:
             print("Using absolute hand action")  # 使用绝对手部动作
             print("hand_action stats", stats["hand_action"])
             print(stats["hand_action"]["max"] - stats["hand_action"]["min"] > 5e-2)
-            # 组合相对姿态和绝对手部动作的统计信息
-            self.stats["action"] = {
-                "min": np.concatenate(
-                    [stats["relative_pose"]["min"], stats["hand_action"]["min"]]
-                ),
-                "max": np.concatenate(
-                    [stats["relative_pose"]["max"], stats["hand_action"]["max"]]
-                ),
-            }
-        print(self.stats["action"])
+        
+        # 不再构建混合的action统计信息，而是在predict_action中分别处理pose和hand部分
         self.model_cfg = model_cfg
 
     def predict_action(self, proprioception, fsr, visual_obs):
@@ -172,8 +149,19 @@ class RealPolicy:
         trajectory = trajectory.detach().to("cpu").numpy()
         naction = trajectory[0]  # 获取第一个批次的结果
         
-        # 反归一化动作数据，恢复到原始尺度
-        action_pred = unnormalize_data(naction, stats=self.stats["action"])
+        # 分别处理pose和hand部分的反归一化，保持与训练时的一致性
+        # pose部分（前6维）：使用relative_pose统计进行反归一化
+        pose_pred = unnormalize_data(naction[:, :6], stats=self.stats["relative_pose"])
+        
+        if self.model_cfg.dataset.relative_hand_action:
+            # 相对手部动作：需要反归一化
+            hand_pred = unnormalize_data(naction[:, 6:], stats=self.stats["relative_hand_action"])
+        else:
+            # 绝对手部动作：训练时没有归一化，推理时也不需要反归一化
+            hand_pred = naction[:, 6:]
+        
+        # 重新组合完整的动作预测
+        action_pred = np.concatenate([pose_pred, hand_pred], axis=1)
         
         # 提取有效的动作序列（从观测范围结束到预测范围结束）
         start = self.obs_horizon - 1
