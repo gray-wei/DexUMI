@@ -650,8 +650,8 @@ class OfflinePolicyDebugger:
                 rotation_vector=relative_poses[i, 3:]
             )
             
-            # 绝对变换 = 初始变换 * 相对变换
-            T_abs = T0 @ T_rel
+            # 绝对变换 = 相对变换 * 初始变换 (修正变换顺序)
+            T_abs = T_rel @ T0
             
             # 转回6DOF
             abs_pose = homogeneous_matrix_to_6dof(T_abs)
