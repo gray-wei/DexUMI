@@ -522,8 +522,8 @@ def main(
                     # Since we're directly in end-effector frame, just apply relative transform
                     T_BN = np.zeros_like(relative_pose)
                     for iter_idx in range(len(relative_pose)):
-                        # Direct application: T_BN = T_BE @ relative_pose
-                        T_BN[iter_idx] = T_BE @ relative_pose[iter_idx]
+                        # Fixed application: T_BN = relative_pose @ T_BE (corrected matrix order)
+                        T_BN[iter_idx] = relative_pose[iter_idx] @ T_BE
                     
                     # ============ DEBUG: Target Poses ============
                     print("\nDEBUG: Target Transformation")
