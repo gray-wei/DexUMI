@@ -129,31 +129,27 @@ class RealPolicy:
             fsr = None
 
         # 处理视觉观测数据 - 与训练时保持完全一致的处理流程
-        # 1. 中心裁剪到正方形（与XhandMultimodalCollection.py完全一致）
         processed_obs = []
         for obs in visual_obs:
-            h, w = obs.shape[:2]  # 应该是 (240, 424, 3)
-            
-            # 中心裁剪为正方形（与训练时完全相同的逻辑）
-            crop_size = min(h, w)  # min(240, 424) = 240
-            start_x = (w - crop_size) // 2  # (424-240)//2 = 92
-            start_y = (h - crop_size) // 2  # (240-240)//2 = 0
-            cropped = obs[start_y:start_y+crop_size, start_x:start_x+crop_size].copy()
-            
-            # 确保正确的240x240尺寸（与训练时一致）
-            if cropped.shape[:2] != (240, 240):
-                cropped = cv2.resize(cropped, (240, 240), interpolation=cv2.INTER_AREA)
-            
+            # 确保是numpy数组
+            if hasattr(obs, "detach"):
+                obs = obs.detach().cpu().numpy()
+            elif hasattr(obs, "numpy"):
+                obs = obs.numpy()
+
+            # 复制一份BGR图像，避免修改输入缓存
+            bgr_obs = np.array(obs, copy=True)
+
             # BGR转RGB（与训练时一致）
-            rgb_obs = cv2.cvtColor(cropped, cv2.COLOR_BGR2RGB)
+            rgb_obs = cv2.cvtColor(bgr_obs, cv2.COLOR_BGR2RGB)
             processed_obs.append(rgb_obs)
-        
+
         visual_obs = np.array(processed_obs)
-        
-        # 2. 使用process_image进行标准化处理（需要添加CenterCrop到224x224以匹配ViT模型）
+
+        # 统一使用与训练等价的Resize+CenterCrop（CenterCrop确保推理确定性）
         visual_obs = process_image(
             visual_obs,
-            optional_transforms=["CenterCrop"],  # 匹配训练时的["Resize", "RandomCrop"]
+            optional_transforms=["Resize", "CenterCrop"],
             resize_shape=self.camera_resize_shape,
         )
         

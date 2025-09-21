@@ -24,6 +24,23 @@ from dexumi.data_recording.data_buffer import PoseInterpolator
 from dexumi.real_env.common.http_client import HTTPRobotClient, HTTPHandClient
 
 
+def center_crop_square(image: np.ndarray, target_size: int = 240) -> np.ndarray:
+    """Center-crop the input image to a square of `target_size` pixels."""
+    h, w = image.shape[:2]
+    crop_size = min(h, w)
+    start_x = (w - crop_size) // 2
+    start_y = (h - crop_size) // 2
+    cropped = image[start_y:start_y + crop_size, start_x:start_x + crop_size]
+    if cropped.shape[0] != target_size or cropped.shape[1] != target_size:
+        cropped = cv2.resize(cropped, (target_size, target_size), interpolation=cv2.INTER_AREA)
+    return cropped
+
+
+def top_left_crop(image: np.ndarray, width: int = 193, height: int = 238) -> np.ndarray:
+    """Crop the image from the top-left corner to match training preprocessing."""
+    return image[:height, :width]
+
+
 def compute_total_force_per_finger(all_fsr_observations):
     """
     Compute the total force for each finger.
@@ -276,17 +293,22 @@ def main(
                     # No conversion needed - pass BGR directly to real_policy.py
                     obs_frame_bgr = obs_frame_rgb  # Actually BGR data from RealSense camera
 
-                    # Step 2: Top-left crop to 193×238 (matching crop_rgb_images.py)
-                    if obs_frame_bgr.shape[:2] == (240, 240):
-                        # Crop from 240×240 to 193×238 using top-left corner
-                        obs_frame_cropped = obs_frame_bgr[:238, :193, :]  # height=238, width=193
-                        print(f"Image processing: {obs_frame_bgr.shape} → crop to {obs_frame_cropped.shape}")
-                    else:
-                        print(f"Warning: Expected 240×240 image, got {obs_frame_bgr.shape}")
-                        obs_frame_cropped = obs_frame_bgr
+                    # Step 1: Center-crop to 240×240, matching online collection
+                    obs_frame_square = center_crop_square(obs_frame_bgr, target_size=240)
 
-                    # Step 3: real_policy.py will handle BGR→RGB conversion, resize to 240×240 and CenterCrop to 224×224
-                    
+                    # Step 2: Top-left crop to 193×238, matching crop_rgb_images.py
+                    obs_frame_cropped = top_left_crop(obs_frame_square, width=193, height=238)
+                    print(
+                        "Image processing:",
+                        obs_frame_bgr.shape,
+                        "→",
+                        obs_frame_square.shape,
+                        "→",
+                        obs_frame_cropped.shape,
+                    )
+
+                    # Step 3: Remaining resize/CenterCrop handled inside RealPolicy
+
                     
                     print(f"Time remaining: {session_duration - (time.time() - session_start_time):.1f}s")
                     if policy.model_cfg.dataset.enable_fsr:
