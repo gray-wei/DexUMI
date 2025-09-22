@@ -157,8 +157,8 @@ class RealPolicy:
             # 相对手部动作：需要反归一化
             hand_pred = unnormalize_data(naction[:, 6:], stats=self.stats["relative_hand_action"])
         else:
-            # 绝对手部动作：训练时没有归一化，推理时也不需要反归一化
-            hand_pred = naction[:, 6:]
+            # 绝对手部动作：训练时被归一化到[-1,1]，推理时需要反归一化
+            hand_pred = unnormalize_data(naction[:, 6:], stats=self.stats["hand_action"])
         
         # 重新组合完整的动作预测
         action_pred = np.concatenate([pose_pred, hand_pred], axis=1)
