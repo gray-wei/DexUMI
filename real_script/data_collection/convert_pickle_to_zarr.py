@@ -39,6 +39,11 @@ from pathlib import Path
 from tqdm import tqdm
 from scipy.spatial.transform import Rotation
 
+# Import XHand scaling constant from DexUMI
+import sys
+sys.path.append(str(Path(__file__).parent.parent.parent))
+from dexumi.constants import XHAND_HAND_MOTOR_SCALE_FACTOR
+
 
 def load_timestamps(timestamp_path: Path) -> np.ndarray:
     """
@@ -131,6 +136,8 @@ def align_multimodal_episode(episode_path: Path, camera_ids: Optional[List[int]]
     
     with open(episode_path / "hand_action.pkl", "rb") as f:
         aligned_hand_action = pickle.load(f).astype(np.float32)
+        # Apply XHand scaling factor to match original DexUMI pipeline
+        aligned_hand_action = aligned_hand_action * XHAND_HAND_MOTOR_SCALE_FACTOR
     
     with open(episode_path / "proprioception.pkl", "rb") as f:
         aligned_proprioception = pickle.load(f).astype(np.float32)
@@ -245,6 +252,8 @@ def load_pickle_episode(episode_path: Path, multimodal_format: bool = False, cam
     
     with open(episode_path / "hand_action.pkl", "rb") as f:
         data["hand_action"] = pickle.load(f).astype(np.float32)
+        # Apply XHand scaling factor to match original DexUMI pipeline
+        data["hand_action"] = data["hand_action"] * XHAND_HAND_MOTOR_SCALE_FACTOR
     
     with open(episode_path / "proprioception.pkl", "rb") as f:
         data["proprioception"] = pickle.load(f).astype(np.float32)
