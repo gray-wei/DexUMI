@@ -782,18 +782,31 @@ def save_episode_offline_aligned(episode_path: str, camera_data: List[Dict], rob
         with open(f"{episode_path}/fsr.pkl", "wb") as f:
             pickle.dump(fsr_data, f)
         
-        # 保存原始时间戳数据 (用于离线对齐)
+        # 保存原始时间戳数据 (用于离线对齐) - 只保存时间戳，不保存图像数据
+        camera_timestamps = []
+        for frame_data in camera_data:
+            frame_timestamps = {}
+            for cam_key, cam_info in frame_data.items():
+                if cam_key.startswith('camera_'):
+                    # 只保存时间戳信息，不保存图像数据
+                    frame_timestamps[cam_key] = {
+                        'hardware_timestamp': cam_info['hardware_timestamp'],
+                        'system_timestamp': cam_info['system_timestamp'],
+                        'capture_time': cam_info['capture_time']
+                    }
+            camera_timestamps.append(frame_timestamps)
+
         with open(f"{episode_path}/raw_timestamps.pkl", "wb") as f:
             pickle.dump({
                 'robot_data': [{
                     'request_timestamp': data['request_timestamp'],
-                    'response_timestamp': data['response_timestamp'], 
+                    'response_timestamp': data['response_timestamp'],
                     'robot_timestamp': data['robot_timestamp'],
                     'tactile_timestamp': data['tactile_timestamp'],
                     'network_delay_robot': data['network_delay_robot'],
                     'network_delay_tactile': data['network_delay_tactile']
                 } for data in robot_data],
-                'camera_data': camera_data  # 完整的相机时间戳信息
+                'camera_data': camera_timestamps  # 只保存时间戳信息
             }, f)
         
         # 保存相机数据 (保持原格式)
