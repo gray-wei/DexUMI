@@ -43,7 +43,7 @@ class CollectionState(Enum):
 class CameraCollector:
     """独立相机采集器 - 高帧率采集，记录硬件时间戳"""
     
-    def __init__(self, max_frames_per_camera: int = 10000):
+    def __init__(self, max_frames_per_camera: int = 3000):
         self.camera_data = {}  # 改为每个相机独立的数据列表 {camera_id: [frames]}
         self._state = CollectionState.STOPPED
         self._state_lock = threading.Lock()
@@ -181,7 +181,7 @@ class CameraCollector:
 class RobotDataCollector:
     """独立机器人数据采集器 - 固定频率采集HTTP数据"""
     
-    def __init__(self, url: str = "http://127.0.0.1:5000/", max_frames: int = 10000):
+    def __init__(self, url: str = "http://127.0.0.1:5000/", max_frames: int = 6000):
         self.url = url
         self.robot_data = []  # 存储采集的机器人数据
         self._state = CollectionState.STOPPED
@@ -326,10 +326,11 @@ class DataCollectionController:
 class XhandMultimodalDataCollector:
     """XHand + Franka多模态数据采集接口"""
     
-    def __init__(self, num_cameras: int = 2, xhand_port: str = "/dev/ttyUSB0"):
+    def __init__(self, num_cameras: int = 2, xhand_port: str = "/dev/ttyUSB0", enable_depth: bool = True):
         self.num_cameras = num_cameras
         self.xhand_port = xhand_port
         self.url = "http://127.0.0.1:5000/"
+        self.enable_depth = enable_depth
         
         # 初始位姿
         self.init_pose = np.array([0.5548533772485196,0.0881488236773295,0.19591474184161564,
@@ -362,7 +363,11 @@ class XhandMultimodalDataCollector:
             self.camera_collector.camera_data[cam_id] = []
         
         print("✓ XHand + Franka多模态数据采集系统初始化完成")
-        print("✓ 相机分辨率: 240x240 (匹配DexUMI训练需求)")
+        print("✓ 相机分辨率: 1280x720 (高清完整图像采集)")
+        if self.enable_depth:
+            print("✓ 深度图采集已启用")
+        else:
+            print("✗ 深度图采集已禁用")
         print("✓ 独立采集模式已启用")
         print(f"✓ 初始化了 {len(self.pipelines)} 个相机的独立数据存储")
         
@@ -399,10 +404,11 @@ class XhandMultimodalDataCollector:
                 config = rs.config()
                 config.enable_device(serial)
                 
-                # 设置分辨率：424x240便于裁剪为240x240
-                config.enable_stream(rs.stream.color, 424, 240, rs.format.bgr8, 30)
-                # 移除深度流以减少带宽和CPU占用（未使用）
-                # config.enable_stream(rs.stream.depth, 424, 240, rs.format.z16, 30)
+                # 设置高清分辨率：1280x720保存完整图像
+                config.enable_stream(rs.stream.color, 1280, 720, rs.format.bgr8, 30)
+                # 条件性启用深度流：用于深度图数据采集
+                if self.enable_depth:
+                    config.enable_stream(rs.stream.depth, 1280, 720, rs.format.z16, 30)
                 
                 try:
                     pipeline.start(config)
@@ -511,27 +517,28 @@ class XhandMultimodalDataCollector:
                 color_frame = frames.get_color_frame()
                 
                 if color_frame:
+                    # 获取深度帧（仅在启用深度采集时）
+                    depth_frame = None
+                    if self.enable_depth:
+                        depth_frame = frames.get_depth_frame()
+
                     # 记录时间戳
                     hardware_timestamp = color_frame.get_timestamp()
                     system_timestamp = time.time()
                     frame_counter += 1
-                    
-                    # 处理图像
+
+                    # 处理RGB图像 - 保存完整高清图像
                     raw_img = np.asanyarray(color_frame.get_data()).copy()
-                    
-                    # 中心裁剪为240x240
-                    h, w = raw_img.shape[:2]
-                    crop_size = min(h, w)
-                    start_x = (w - crop_size) // 2
-                    start_y = (h - crop_size) // 2
-                    cropped = raw_img[start_y:start_y+crop_size, start_x:start_x+crop_size].copy()
-                    
-                    if cropped.shape[:2] != (240, 240):
-                        cropped = cv2.resize(cropped, (240, 240), interpolation=cv2.INTER_AREA)
+
+                    # 处理深度图像（仅在启用深度采集时）
+                    depth_data = None
+                    if self.enable_depth and depth_frame:
+                        depth_data = np.asanyarray(depth_frame.get_data()).copy()
                     
                     frame_data = {
                         f'camera_{camera_id}': {
-                            'rgb': cropped,
+                            'rgb': raw_img,  # 保存完整高清图像
+                            'depth': depth_data,  # 添加深度数据
                             'hardware_timestamp': hardware_timestamp,
                             'system_timestamp': system_timestamp,
                             'capture_time': capture_start
@@ -807,9 +814,10 @@ def save_episode_offline_aligned(episode_path: str, camera_data: List[Dict], rob
             cam_dir = f"{episode_path}/camera_{cam_idx}"
             os.makedirs(cam_dir, exist_ok=True)
             
-            # 提取RGB数据和时间戳
+            # 提取RGB数据、深度数据和时间戳
             rgb_data = [frame['rgb'] for frame in frames]
-            hardware_timestamps = [frame['hardware_timestamp'] for frame in frames]  
+            depth_data = [frame['depth'] for frame in frames if frame.get('depth') is not None]
+            hardware_timestamps = [frame['hardware_timestamp'] for frame in frames]
             system_timestamps = [frame['system_timestamp'] for frame in frames]
             
             if rgb_data:
@@ -827,10 +835,19 @@ def save_episode_offline_aligned(episode_path: str, camera_data: List[Dict], rob
                 with open(f"{cam_dir}/hardware_timestamps.pkl", "wb") as f:
                     pickle.dump(np.array(hardware_timestamps), f)
                 
+                # 保存深度数据
+                if depth_data:
+                    depth_array = np.array(depth_data)
+                    with open(f"{cam_dir}/depth.pkl", "wb") as f:
+                        pickle.dump(depth_array, f)
+                
                 camera_data_saved[cam_key] = {
                     'frames': len(rgb_data),
-                    'shape': rgb_array[0].shape if len(rgb_array) > 0 else None,
-                    'size_mb': rgb_array.nbytes / (1024 * 1024)
+                    'rgb_shape': rgb_array[0].shape if len(rgb_array) > 0 else None,
+                    'rgb_size_mb': rgb_array.nbytes / (1024 * 1024),
+                    'depth_frames': len(depth_data) if depth_data else 0,
+                    'depth_shape': depth_array[0].shape if depth_data and len(depth_array) > 0 else None,
+                    'depth_size_mb': depth_array.nbytes / (1024 * 1024) if depth_data else 0
                 }
         
         # 创建兼容的timestamps.pkl文件 (convert_pickle_to_zarr.py需要)
@@ -846,7 +863,8 @@ def save_episode_offline_aligned(episode_path: str, camera_data: List[Dict], rob
         print(f"  - 机器人数据: {len(robot_data)} 帧")
         print(f"  - 相机数据:")
         for cam_name, info in camera_data_saved.items():
-            print(f"    * {cam_name}: {info['frames']} 帧, 形状={info['shape']}, 大小={info['size_mb']:.2f}MB")
+            depth_info = f", 深度={info['depth_frames']}帧({info['depth_size_mb']:.2f}MB)" if info['depth_frames'] > 0 else ", 无深度数据"
+            print(f"    * {cam_name}: RGB={info['frames']}帧 {info['rgb_shape']}({info['rgb_size_mb']:.2f}MB){depth_info}")
         print(f"  - 原始时间戳已保存，可用于后续对齐")
         
         return True
@@ -884,6 +902,8 @@ def main():
                        help='数据保存目录 (默认: XhandData_Multimodal)')
     parser.add_argument('--episode_start', type=int, default=None,
                        help='起始episode编号 (默认: 自动检测)')
+    parser.add_argument('--enable_depth', action='store_true', default=False,
+                       help='启用深度图采集 (默认: 关闭)')
     
     args = parser.parse_args()
     
@@ -916,15 +936,20 @@ def main():
     print(f"\n初始化多模态采集系统...")
     print(f"- 相机数量: {args.num_cameras}")
     print(f"- 数据目录: {args.data_dir}")
-    print(f"- 图像分辨率: 240x240 (DexUMI训练格式)")
+    depth_status = "已启用" if args.enable_depth else "已禁用"
+    print(f"- 图像分辨率: 1280x720 (高清完整图像, 深度图{depth_status})")
+    print(f"- 深度图采集: {depth_status}")
     
-    data_collector = XhandMultimodalDataCollector(num_cameras=args.num_cameras)
+    data_collector = XhandMultimodalDataCollector(num_cameras=args.num_cameras, enable_depth=args.enable_depth)
     
     print("\n" + "="*70)
     print("XHand + Franka多模态数据采集系统")
     print("="*70)
     print("\n✓ 系统初始化完成！")
     print("\n核心特性:")
+    print("  • 高清图像采集 - 1280x720完整图像，无裁剪损失")
+    depth_feature = "已启用" if args.enable_depth else "已禁用"
+    print(f"  • 深度图采集 - RGB+Depth同步数据({depth_feature})，完美时间戳对齐")
     print("  • 独立采集 - 相机30Hz，机器人20Hz，各自最优性能")
     print("  • 高精度时间戳 - 硬件+系统双重时间戳记录")
     print("  • 离线对齐 - 消除在线同步复杂性")
