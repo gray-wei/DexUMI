@@ -363,7 +363,7 @@ class XhandMultimodalDataCollector:
             self.camera_collector.camera_data[cam_id] = []
         
         print("✓ XHand + Franka多模态数据采集系统初始化完成")
-        print("✓ 相机分辨率: 1280x720 (高清完整图像采集)")
+        print("✓ 相机分辨率: 1280x720 (采集) → 240x240 (存储)")
         if self.enable_depth:
             print("✓ 深度图采集已启用")
         else:
@@ -527,18 +527,20 @@ class XhandMultimodalDataCollector:
                     system_timestamp = time.time()
                     frame_counter += 1
 
-                    # 处理RGB图像 - 保存完整高清图像
-                    raw_img = np.asanyarray(color_frame.get_data()).copy()
+                    # 处理RGB图像 - resize到240x240后存储（与推理时处理一致）
+                    raw_img = np.asanyarray(color_frame.get_data())
+                    resized_img = cv2.resize(raw_img, (240, 240), interpolation=cv2.INTER_AREA).copy()
 
                     # 处理深度图像（仅在启用深度采集时）
                     depth_data = None
                     if self.enable_depth and depth_frame:
-                        depth_data = np.asanyarray(depth_frame.get_data()).copy()
+                        depth_raw = np.asanyarray(depth_frame.get_data())
+                        depth_data = cv2.resize(depth_raw, (240, 240), interpolation=cv2.INTER_AREA).copy()
                     
                     frame_data = {
                         f'camera_{camera_id}': {
-                            'rgb': raw_img,  # 保存完整高清图像
-                            'depth': depth_data,  # 添加深度数据
+                            'rgb': resized_img,  # 存储240x240图像
+                            'depth': depth_data,  # 存储240x240深度图
                             'hardware_timestamp': hardware_timestamp,
                             'system_timestamp': system_timestamp,
                             'capture_time': capture_start
@@ -950,7 +952,7 @@ def main():
     print(f"- 相机数量: {args.num_cameras}")
     print(f"- 数据目录: {args.data_dir}")
     depth_status = "已启用" if args.enable_depth else "已禁用"
-    print(f"- 图像分辨率: 1280x720 (高清完整图像, 深度图{depth_status})")
+    print(f"- 图像分辨率: 1280x720采集 → 240x240存储 (深度图{depth_status})")
     print(f"- 深度图采集: {depth_status}")
     
     data_collector = XhandMultimodalDataCollector(num_cameras=args.num_cameras, enable_depth=args.enable_depth)
@@ -960,7 +962,7 @@ def main():
     print("="*70)
     print("\n✓ 系统初始化完成！")
     print("\n核心特性:")
-    print("  • 高清图像采集 - 1280x720完整图像，无裁剪损失")
+    print("  • 空间优化采集 - 1280x720采集后resize到240x240存储，节省95%空间")
     depth_feature = "已启用" if args.enable_depth else "已禁用"
     print(f"  • 深度图采集 - RGB+Depth同步数据({depth_feature})，完美时间戳对齐")
     print("  • 独立采集 - 相机30Hz，机器人20Hz，各自最优性能")
