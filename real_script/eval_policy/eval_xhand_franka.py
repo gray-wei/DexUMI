@@ -24,20 +24,34 @@ from dexumi.data_recording.data_buffer import PoseInterpolator
 from dexumi.real_env.common.http_client import HTTPRobotClient, HTTPHandClient
 
 
-def center_crop_square(image: np.ndarray, target_size: int = 240) -> np.ndarray:
-    """Center-crop the input image to a square of `target_size` pixels."""
-    h, w = image.shape[:2]
-    crop_size = min(h, w)
-    start_x = (w - crop_size) // 2
-    start_y = (h - crop_size) // 2
-    cropped = image[start_y:start_y + crop_size, start_x:start_x + crop_size]
-    if cropped.shape[0] != target_size or cropped.shape[1] != target_size:
-        cropped = cv2.resize(cropped, (target_size, target_size), interpolation=cv2.INTER_AREA)
-    return cropped
+def resize_to_square(image: np.ndarray, target_size: int = 240) -> np.ndarray:
+    """
+    Resize image to square using INTER_AREA interpolation.
+    Matches XhandMultimodalCollection.py line 532.
+
+    Args:
+        image: Input image (H, W, C)
+        target_size: Target size for both width and height (default 240)
+
+    Returns:
+        Resized square image of shape (target_size, target_size, C)
+    """
+    return cv2.resize(image, (target_size, target_size), interpolation=cv2.INTER_AREA)
 
 
-def top_left_crop(image: np.ndarray, width: int = 193, height: int = 238) -> np.ndarray:
-    """Crop the image from the top-left corner to match training preprocessing."""
+def crop_to_training_size(image: np.ndarray, width: int = 160, height: int = 240) -> np.ndarray:
+    """
+    Crop from top-left corner to match crop_rgb_images.py processing.
+    Matches crop_rgb_images.py line 39-40: [:240, :160]
+
+    Args:
+        image: Input image (H, W, C)
+        width: Target width (default 160)
+        height: Target height (default 240)
+
+    Returns:
+        Cropped image of shape (height, width, C) = (240, 160, 3)
+    """
     return image[:height, :width]
 
 
@@ -187,11 +201,11 @@ def main(
         return
 
     # Use the first available camera for observation
-    # Match training format exactly: 424x240 BGR -> center crop to 240x240 (same as XhandMultimodalCollection.py)
+    # Match training collection format: 1280x720 (XhandMultimodalCollection.py line 408)
     obs_camera = RealSenseCamera(
         camera_name="obs camera",
         device_id=all_cameras[0],
-        camera_resolution=(424, 240),  # Exact same as training: 424x240
+        camera_resolution=(1280, 720),  # Matching XhandMultimodalCollection.py data collection
         enable_depth=False,
         fps=30
     )
@@ -288,28 +302,36 @@ def main(
                     obs_frame_rgb = obs_frame.rgb.copy()
 
                     # ============ IMAGE PREPROCESSING TO MATCH TRAINING ============
-                    # Training pipeline: 424×240 → 240×240 → 193×238 → resize to 240×240 → RandomCrop to 224×224
+                    # Complete training pipeline (matching actual data collection):
+                    # 1. XhandMultimodalCollection.py: 1280×720 → resize to 240×240 (INTER_AREA)
+                    # 2. crop_rgb_images.py: 240×240 → crop to 160×240 (top-left)
+                    # 3. train_diffusion_policy.yaml: 160×240 → resize to 240×240 → CenterCrop to 224×224
+                    #
                     # RealSense camera outputs BGR format (despite variable name 'rgb')
-                    # No conversion needed - pass BGR directly to real_policy.py
+                    # No color conversion needed - BGR passed to real_policy.py which handles BGR→RGB
                     obs_frame_bgr = obs_frame_rgb  # Actually BGR data from RealSense camera
 
-                    # Step 1: Center-crop to 240×240, matching online collection
-                    obs_frame_square = center_crop_square(obs_frame_bgr, target_size=240)
+                    # Step 1: Resize to 240×240 using INTER_AREA (matching XhandMultimodalCollection.py:532)
+                    obs_frame_square = resize_to_square(obs_frame_bgr, target_size=240)
 
-                    # Step 2: Top-left crop to 193×238, matching crop_rgb_images.py
-                    obs_frame_cropped = top_left_crop(obs_frame_square, width=193, height=238)
+                    # Step 2: Top-left crop to 160×240 (matching crop_rgb_images.py:39-40)
+                    obs_frame_cropped = crop_to_training_size(obs_frame_square, width=160, height=240)
+
+                    # Step 3: Remaining processing in real_policy.py:
+                    #   - BGR → RGB conversion
+                    #   - Resize to 240×240 (will stretch from 160×240, matching training)
+                    #   - CenterCrop to 224×224
+                    #   - Normalize
+
                     print(
                         "Image processing:",
-                        obs_frame_bgr.shape,
+                        obs_frame_bgr.shape,        # Should be (720, 1280, 3)
                         "→",
-                        obs_frame_square.shape,
+                        obs_frame_square.shape,     # Should be (240, 240, 3)
                         "→",
-                        obs_frame_cropped.shape,
+                        obs_frame_cropped.shape,    # Should be (240, 160, 3) - note: numpy uses (H,W,C)
                     )
 
-                    # Step 3: Remaining resize/CenterCrop handled inside RealPolicy
-
-                    
                     print(f"Time remaining: {session_duration - (time.time() - session_start_time):.1f}s")
                     if policy.model_cfg.dataset.enable_fsr:
                         print("Using FSR")
@@ -390,7 +412,7 @@ def main(
                         np.array(list(fsr_obs)).astype(np.float32)
                         if policy.model_cfg.dataset.enable_fsr
                         else None,
-                        obs_frame_cropped[None, ...],  # Use cropped BGR image (193×238, will be converted to RGB in real_policy.py)
+                        obs_frame_cropped[None, ...],  # Use cropped BGR image (160×240 as (H,W,C), will be converted to RGB in real_policy.py)
                     )
                     
                     print("\nDEBUG: Raw Action Output")
