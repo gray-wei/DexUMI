@@ -1,31 +1,58 @@
 import os
 import time
 from collections import deque
+from datetime import datetime
 
 import click
 import cv2
 import numpy as np
 import scipy.spatial.transform as st
 
-from dexumi.camera.camera import FrameData
 from dexumi.camera.realsense_camera import RealSenseCamera, get_all_realsense_cameras
 from dexumi.common.frame_manager import FrameRateContext
 from dexumi.common.utility.matrix import (
     homogeneous_matrix_to_6dof,
     vec6dof_to_homogeneous_matrix,
 )
-from dexumi.common.utility.video import (
-    extract_frames_videos,
-)
+
 from dexumi.constants import (
     XHAND_HAND_MOTOR_SCALE_FACTOR,
 )
-from dexumi.data_recording import VideoRecorder
 from dexumi.data_recording.data_buffer import PoseInterpolator
-from dexumi.data_recording.record_manager import RecorderManager
 
 # Import HTTP control classes
 from dexumi.real_env.common.http_client import HTTPRobotClient, HTTPHandClient
+
+
+def resize_to_square(image: np.ndarray, target_size: int = 240) -> np.ndarray:
+    """
+    Resize image to square using INTER_AREA interpolation.
+    Matches XhandMultimodalCollection.py line 532.
+
+    Args:
+        image: Input image (H, W, C)
+        target_size: Target size for both width and height (default 240)
+
+    Returns:
+        Resized square image of shape (target_size, target_size, C)
+    """
+    return cv2.resize(image, (target_size, target_size), interpolation=cv2.INTER_AREA)
+
+
+def crop_to_training_size(image: np.ndarray, width: int = 160, height: int = 240) -> np.ndarray:
+    """
+    Crop from top-left corner to match crop_rgb_images.py processing.
+    Matches crop_rgb_images.py line 39-40: [:240, :160]
+
+    Args:
+        image: Input image (H, W, C)
+        width: Target width (default 160)
+        height: Target height (default 240)
+
+    Returns:
+        Cropped image of shape (height, width, C) = (240, 160, 3)
+    """
+    return image[:height, :width]
 
 
 def compute_total_force_per_finger(all_fsr_observations):
@@ -48,6 +75,61 @@ def compute_total_force_per_finger(all_fsr_observations):
     return total_force
 
 
+def save_video_offline(frames, timestamps, save_dir, session_start_time):
+    """
+    Save collected frames as video file offline after inference session.
+    
+    Parameters:
+    frames (list): List of RGB frames (numpy arrays)
+    timestamps (list): List of timestamps for each frame
+    save_dir (str): Directory to save the video file
+    session_start_time (float): Start time of the session for filename generation
+    """
+    if not frames:
+        print("No frames to save")
+        return
+    
+    # Create save directory if not exists
+    os.makedirs(save_dir, exist_ok=True)
+    
+    # Generate unique filename based on session start time
+    timestamp_str = datetime.fromtimestamp(session_start_time).strftime("%Y%m%d_%H%M%S")
+    filename = f"inference_session_{timestamp_str}.mp4"
+    filepath = os.path.join(save_dir, filename)
+    
+    # Video parameters
+    height, width, channels = frames[0].shape
+    
+    # Calculate FPS from actual timestamps
+    if len(timestamps) > 1:
+        duration = timestamps[-1] - timestamps[0]
+        fps = (len(frames) - 1) / duration if duration > 0 else 30.0
+    else:
+        fps = 30.0
+    
+    # Ensure reasonable FPS range
+    fps = max(10.0, min(fps, 60.0))
+    
+    print(f"Saving video with {len(frames)} frames at {fps:.1f} FPS to: {filepath}")
+    
+    # Initialize VideoWriter
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    out = cv2.VideoWriter(filepath, fourcc, fps, (width, height))
+    
+    if not out.isOpened():
+        print(f"Error: Could not open VideoWriter for {filepath}")
+        return
+    
+    # Write frames
+    for frame in frames:
+        # obs_frame.rgb is actually BGR format (despite the name)
+        # No color conversion needed - save directly
+        out.write(frame)
+    
+    out.release()
+    print(f"Video saved successfully: {filepath}")
+
+
 # Fixed initial positions (consistent with data collection)
 # Initial robot pose from XhandMultimodalCollection.py (7D: xyz + quaternion)
 initial_robot_pose = np.array([
@@ -59,32 +141,26 @@ initial_robot_pose = np.array([
 obs_horizon = 1
 binary_cutoff = [10, 10, 10]
 
-# Initial hand position (open position)
+# Initial hand position (open position) - Updated to match open_gripper command
 initial_hand_pos = np.array([
-    0.92755819,
-    0.52026953,
-    0.22831853,
-    0.0707963,
-    1.1,
-    0.15707963,
-    0.95,
-    0.12217305,
-    1.0392188,
-    0.03490659,
-    1.0078164,
-    0.17453293,
+    # 1.516937255859375,
+    0.156546025276184082,
+    0.5177657604217529,
+    0.04799513891339302,
+    0.01787799410521984,
+    0.005817593075335026,
+    0.034905556589365005,
+    0.014543981291353703,
+    0.011635186150670052,
+    0.002908796537667513,
+    0.01599838025867939,
+    0.007271990645676851,
+    0.024724768474698067,
 ])
 
 
 @click.command()
 @click.option("-f", "--frequency", type=float, default=10, help="Control frequency (Hz)")
-@click.option(
-    "-rc", "--enable_record_camera", is_flag=True, help="Enable record camera"
-)
-@click.option(
-    "-ct", "--camera_type", type=click.Choice(['realsense', 'oak']), default="realsense", 
-    help="Camera type to use"
-)
 @click.option(
     "-mp",
     "--model_path",
@@ -105,124 +181,48 @@ initial_hand_pos = np.array([
     help="Robot action latency",
 )
 @click.option("-eh", "--exec_horizon", type=int, default=8, help="Execution horizon")
-@click.option(
-    "-vp",
-    "--video_record_path",
-    type=str,
-    default="video_record",
-    help="Path to save video recordings",
-)
-@click.option(
-    "-mep",
-    "--match_episode_path",
-    type=str,
-    default=None,
-    help="Path to match episode folder",
-)
 def main(
     frequency,
-    enable_record_camera,
-    camera_type,
     model_path,
     ckpt,
     camera_latency,
     hand_action_latency,
     robot_action_latency,
     exec_horizon,
-    video_record_path,
-    match_episode_path,
 ):
     # Initialize HTTP clients for robot and hand control
     robot_client = HTTPRobotClient(base_url="http://127.0.0.1:5000")
     dexhand_client = HTTPHandClient(base_url="http://127.0.0.1:5000")
     
-    # Initialize cameras based on selected type
-    if camera_type == "realsense":
-        all_cameras = get_all_realsense_cameras()
-        if len(all_cameras) < 1:
-            print("Warning: No RealSense cameras found. Exiting...")
-            return
-        
-        # Use the first available camera for observation
-        # Configure for 240x240 output to match training data
-        obs_camera = RealSenseCamera(
-            camera_name="obs camera",
-            device_id=all_cameras[0],
-            camera_resolution=(640, 480),  # Native resolution
-            enable_depth=False,  # We don't need depth for inference
-            fps=30
-        )
-        camera_sources = [obs_camera]
-        
-        if enable_record_camera and len(all_cameras) > 1:
-            record_camera = RealSenseCamera(
-                camera_name="record camera",
-                device_id=all_cameras[1],
-                camera_resolution=(640, 480),
-                enable_depth=False,
-                fps=30
-            )
-            camera_sources.append(record_camera)
-    else:
-        # Fall back to OAK cameras
-        from dexumi.camera.oak_camera import OakCamera, get_all_oak_cameras
-        all_cameras = get_all_oak_cameras()
-        if len(all_cameras) < 1:
-            print("Warning: No OAK cameras found. Exiting...")
-            return
-        
-        obs_camera = OakCamera("obs camera", device_id=all_cameras[0])
-        camera_sources = [obs_camera]
-        
-        if enable_record_camera and len(all_cameras) > 1:
-            record_camera = OakCamera("record camera", device_id=all_cameras[1])
-            camera_sources.append(record_camera)
-    # Start cameras
-    for camera in camera_sources:
-        camera.start_streaming()
+    # Initialize RealSense cameras
+    all_cameras = get_all_realsense_cameras()
+    if len(all_cameras) < 1:
+        print("Warning: No RealSense cameras found. Exiting...")
+        return
+
+    # Use the first available camera for observation
+    # Match training collection format: 1280x720 (XhandMultimodalCollection.py line 408)
+    obs_camera = RealSenseCamera(
+        camera_name="obs camera",
+        device_id=all_cameras[0],
+        camera_resolution=(1280, 720),  # Matching XhandMultimodalCollection.py data collection
+        enable_depth=False,
+        fps=30
+    )
     
-    video_recorder = VideoRecorder(
-        record_fps=45,
-        stream_fps=60,
-        video_record_path=video_record_path,
-        camera_sources=camera_sources,
-        frame_data_class=FrameData,
-        verbose=False,
-    )
-    recorder_manager = RecorderManager(
-        recorders=[video_recorder],
-        verbose=False,
-    )
-    recorder_manager.start_streaming()
+    # Start camera
+    obs_camera.start_streaming()
+    
 
     dt = 1 / frequency
-    match_episode_folder = match_episode_path
     
-    # Main control loop (without manual control)
+    # Main control loop
     while True:
-        print("Ready!")
-        
-        # Handle match episode if provided
-        if match_episode_folder is not None:
-            print(
-                f"Extracting frames from match episode {recorder_manager.episode_id}"
-            )
-            # Extract frames for reference (not used in simplified version)
-            _ = extract_frames_videos(
-                os.path.join(
-                    match_episode_folder,
-                    f"episode_{recorder_manager.episode_id}/camera_1.mp4",
-                ),
-                BGR2RGB=True,
-            )
-            # match_initial_frame = match_episode[0]  # Not used in simplified version
-        else:
-            print("No match episode folder provided")
-            # match_initial_frame = None  # Not used in simplified version
+        print("Ready! Starting 20-second inference session...")
             
         # Reset robot to initial position
         print("Moving robot to initial position...")
-        # Convert initial pose from 7D (xyz + quat) to 6D (xyz + rotvec) for compatibility
+        # Convert initial pose from 7D (xyz + quat) to 6D (xyz + rotvec) for robot control
         initial_pose_6d = np.zeros(6)
         initial_pose_6d[:3] = initial_robot_pose[:3]
         initial_pose_6d[3:] = st.Rotation.from_quat(initial_robot_pose[3:]).as_rotvec()
@@ -232,14 +232,10 @@ def main(
         
         # Initialize FSR observations
         fsr_obs = deque(maxlen=obs_horizon)
-        fsr_raw_obs = dexhand_client.get_tactile(calc=True)
-        # Reshape fsr_raw_obs to add a batch dimension
-        fsr_raw_obs = fsr_raw_obs[None, ...]  # This adds a dimension at the start
-        fsr_raw_obs = compute_total_force_per_finger(fsr_raw_obs)[0]
-        fsr_value = np.array(fsr_raw_obs[:3])
-        print("fsr_value", fsr_value)
+        
+        # Initialize FSR with proper dimensions
         for _ in range(obs_horizon):
-            fsr_obs.append(np.zeros(2))
+            fsr_obs.append(np.zeros(3, dtype=np.float32))  # 3 fingers, binary values
 
         print(
             "resetting hand----------------------------------------------------------------------------------"
@@ -263,139 +259,106 @@ def main(
             model_path=model_path,
             ckpt=ckpt,
         )
-        
-        # Start recording
-        if recorder_manager.reset_episode_recording():
-            click.echo("Starting recording...")
-            recorder_manager.start_recording()
 
         # Calculate inference parameters
         inference_iter_time = exec_horizon * dt
         inference_fps = 1 / inference_iter_time
         print("inference_fps", inference_fps)
         
-        # Policy execution loop
-        while True:
+        # Start 20-second inference session
+        session_start_time = time.time()
+        session_duration = 50.0  # 20 seconds
+        
+        # Initialize video recording storage
+        video_frames = []
+        video_timestamps = []
+        
+        # Video recording at full camera FPS (30fps) - independent of inference
+        import threading
+        video_recording_active = threading.Event()
+        video_recording_active.set()
+        
+        def video_recording_thread():
+            while video_recording_active.is_set() and (time.time() - session_start_time < session_duration):
+                frame = obs_camera.get_camera_frame()
+                if frame is not None:
+                    video_frames.append(frame.rgb.copy())
+                    video_timestamps.append(time.time())
+                time.sleep(1/30)  # 30 FPS for video recording
+        
+        # Start video recording in background
+        video_thread = threading.Thread(target=video_recording_thread)
+        video_thread.daemon = True
+        video_thread.start()
+        
+        # Policy execution loop (runs at inference_fps)
+        while time.time() - session_start_time < session_duration:
                 with FrameRateContext(frame_rate=inference_fps):
-                    # gather observation
-                    record_frame = recorder_manager.get_latest_frames()
-                    if enable_record_camera:
-                        video_frame = record_frame["record camera"][-1]
-                        viz_frame = video_frame.rgb.copy()
-                        cv2.putText(
-                            viz_frame,
-                            f"Episode: {recorder_manager.episode_id}",
-                            (10, 30),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            1,
-                            (0, 255, 0),
-                            2,
-                        )
-
-                    obs_frame = record_frame["obs camera"][-1]
+                    # Get observation from camera for inference
+                    obs_frame = obs_camera.get_camera_frame()
+                    if obs_frame is None:
+                        continue
                     obs_frame_recieved_time = obs_frame.receive_time
                     obs_frame_rgb = obs_frame.rgb.copy()
-                    
-                    # Ensure image is 240x240 for model input
-                    if obs_frame_rgb.shape[:2] != (240, 240):
-                        # Center crop to square
-                        h, w = obs_frame_rgb.shape[:2]
-                        crop_size = min(h, w)
-                        start_x = (w - crop_size) // 2
-                        start_y = (h - crop_size) // 2
-                        cropped = obs_frame_rgb[start_y:start_y+crop_size, start_x:start_x+crop_size]
-                        # Resize to 240x240
-                        obs_frame_rgb = cv2.resize(cropped, (240, 240), interpolation=cv2.INTER_AREA)
-                    cv2.putText(
-                        obs_frame_rgb,
-                        f"Episode: {recorder_manager.episode_id}",
-                        (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        1,
-                        (0, 255, 0),
-                        2,
+
+                    # ============ IMAGE PREPROCESSING TO MATCH TRAINING ============
+                    # Complete training pipeline (matching actual data collection):
+                    # 1. XhandMultimodalCollection.py: 1280×720 → resize to 240×240 (INTER_AREA)
+                    # 2. crop_rgb_images.py: 240×240 → crop to 160×240 (top-left)
+                    # 3. train_diffusion_policy.yaml: 160×240 → resize to 240×240 → CenterCrop to 224×224
+                    #
+                    # RealSense camera outputs BGR format (despite variable name 'rgb')
+                    # No color conversion needed - BGR passed to real_policy.py which handles BGR→RGB
+                    obs_frame_bgr = obs_frame_rgb  # Actually BGR data from RealSense camera
+
+                    # Step 1: Resize to 240×240 using INTER_AREA (matching XhandMultimodalCollection.py:532)
+                    obs_frame_square = resize_to_square(obs_frame_bgr, target_size=240)
+
+                    # Step 2: Top-left crop to 160×240 (matching crop_rgb_images.py:39-40)
+                    obs_frame_cropped = crop_to_training_size(obs_frame_square, width=160, height=240)
+
+                    # Step 3: Remaining processing in real_policy.py:
+                    #   - BGR → RGB conversion
+                    #   - Resize to 240×240 (will stretch from 160×240, matching training)
+                    #   - CenterCrop to 224×224
+                    #   - Normalize
+
+                    print(
+                        "Image processing:",
+                        obs_frame_bgr.shape,        # Should be (720, 1280, 3)
+                        "→",
+                        obs_frame_square.shape,     # Should be (240, 240, 3)
+                        "→",
+                        obs_frame_cropped.shape,    # Should be (240, 160, 3) - note: numpy uses (H,W,C)
                     )
-                    if policy.model_cfg.dataset.enable_fsr:
-                        # Draw FSR values on viz_frame
-                        cv2.putText(
-                            obs_frame_rgb,
-                            f"FSR1: {fsr_value[0]:.0f}",
-                            (10, 60),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            1,
-                            (0, 255, 0),
-                            2,
-                        )
-                        cv2.putText(
-                            obs_frame_rgb,
-                            f"FSR2: {fsr_value[1]:.0f}",
-                            (10, 90),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            1,
-                            (0, 255, 0),
-                            2,
-                        )
-                        # Draw binary cutoff values
-                        cv2.putText(
-                            obs_frame_rgb,
-                            f"FSR1 Binary: {int(fsr_value[0] > binary_cutoff[0])}",
-                            (10, 120),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            1,
-                            (0, 255, 0),
-                            2,
-                        )
-                        cv2.putText(
-                            obs_frame_rgb,
-                            f"FSR2 Binary: {int(fsr_value[1] > binary_cutoff[1])}",
-                            (10, 150),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            1,
-                            (0, 255, 0),
-                            2,
-                        )
-                        cv2.putText(
-                            obs_frame_rgb,
-                            f"FSR3 Binary: {int(fsr_value[2] > binary_cutoff[2])}",
-                            (10, 210),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            1,
-                            (0, 255, 0),
-                            2,
-                        )
-                    cv2.imshow("obs frame", obs_frame_rgb)
-                    if enable_record_camera:
-                        cv2.imshow("record frame", viz_frame)
-                    key = cv2.waitKey(1) & 0xFF
-                    if key == ord("q"):
-                        if recorder_manager.stop_recording():
-                            recorder_manager.save_recordings()
-                        cv2.destroyAllWindows()
-                        break
-                    elif key == ord("a"):
-                        if recorder_manager.stop_recording():
-                            recorder_manager.clear_recording()
-                        break
+
+                    print(f"Time remaining: {session_duration - (time.time() - session_start_time):.1f}s")
                     if policy.model_cfg.dataset.enable_fsr:
                         print("Using FSR")
                         fsr_raw_obs = dexhand_client.get_tactile(calc=True)
                         print("raw", fsr_raw_obs)
-                        # Reshape fsr_raw_obs to add a batch dimension
-                        fsr_raw_obs = fsr_raw_obs[
-                            None, ...
-                        ]  # This adds a dimension at the start
-                        fsr_raw_obs = compute_total_force_per_finger(fsr_raw_obs)[0]
-                        fsr_value = np.array(fsr_raw_obs[:3])
+                        print(f"FSR raw shape: {fsr_raw_obs.shape}")
+                        
+                        # Process FSR data - should be (5, 3) -> compute total force per finger -> take first 3 fingers
+                        if fsr_raw_obs.ndim == 2 and fsr_raw_obs.shape[0] >= 3:
+                            # Compute total force per finger (magnitude of 3D force vector)
+                            fsr_total_forces = np.linalg.norm(fsr_raw_obs, axis=1)  # Shape: (5,)
+                            # Take first 3 fingers to match training data
+                            fsr_value = fsr_total_forces[:3]  # Shape: (3,)
+                        else:
+                            # Fallback: if shape is unexpected, try to extract 3 values
+                            fsr_value = fsr_raw_obs.flatten()[:3]
+                        
+                        print(f"fsr_value shape: {fsr_value.shape}")
                         print("fsr_value", fsr_value)
                         fsr_value = fsr_value.astype(np.float32)
-                        # Apply binary cutoff
-                        fsr_value_binary = (fsr_value >= binary_cutoff).astype(
-                            np.float32
-                        )
+                        
+                        # Apply binary cutoff (same as training)
+                        fsr_value_binary = (fsr_value >= binary_cutoff).astype(np.float32)
                         fsr_obs.append(fsr_value_binary)
-                    # inference action
-                    t_inference = time.monotonic()
-                    # camera latency + transfer time
+                    # inference action - use wall clock time consistently
+                    t_inference = time.time()  # Use wall clock time consistently with camera and HTTP client
+                    # camera latency + transfer time (both now in wall clock time)
                     print(
                         "t_inference|obs_frame_recieved_time",
                         t_inference,
@@ -406,26 +369,70 @@ def main(
                     )
                     print("camera_total_latency", camera_total_latency)
                     t_actual_inference = t_inference - camera_total_latency
-                    # Prepare image for model (ensure 240x240)
-                    model_input_image = obs_frame.rgb.copy()
-                    if model_input_image.shape[:2] != (240, 240):
-                        h, w = model_input_image.shape[:2]
-                        crop_size = min(h, w)
-                        start_x = (w - crop_size) // 2
-                        start_y = (h - crop_size) // 2
-                        cropped = model_input_image[start_y:start_y+crop_size, start_x:start_x+crop_size]
-                        model_input_image = cv2.resize(cropped, (240, 240), interpolation=cv2.INTER_AREA)
                     
+                    # ============ TIMESTAMP VERIFICATION ============
+                    print(f"\n🕒 TIMESTAMP DEBUG:")
+                    print(f"  Camera timestamp: {obs_frame_recieved_time:.3f} (wall time)")
+                    print(f"  Inference timestamp: {t_inference:.3f} (wall time)")
+                    print(f"  Camera to inference delay: {t_inference - obs_frame_recieved_time:.3f}s (should be < 0.1s)")
+                    print(f"  Actual inference timestamp: {t_actual_inference:.3f} (wall time)")
+                    # ============ TIMESTAMP VERIFICATION END ============
+                    
+                    # ============ DEBUG SECTION START ============
+                    print("\n" + "="*50)
+                    print("DEBUG: Input Information")
+                    print(f"RealSense camera image shape: {obs_frame_rgb.shape} (actually BGR despite variable name)")
+                    print(f"Cropped BGR image shape: {obs_frame_cropped.shape}, dtype: {obs_frame_cropped.dtype}")
+                    print(f"Cropped image range: [{obs_frame_cropped.min():.2f}, {obs_frame_cropped.max():.2f}]")
+                    if policy.model_cfg.dataset.enable_fsr:
+                        print(f"FSR obs shape: {np.array(list(fsr_obs)).shape}")
+                        print(f"FSR obs values: {np.array(list(fsr_obs))[-1]}")  # Last FSR reading
+                    
+                    # Get robot proprioception data for model input
+                    robot_state = robot_client.get_state()
+                    proprioception = None
+                    
+                    if robot_state and "state" in robot_state:
+                        # Extract joint positions and velocities
+                        joint_q = np.array(robot_state["state"]["ActualQ"])  # 7D joint positions
+                        joint_dq = np.array(robot_state["state"]["ActualQd"])  # 7D joint velocities
+                        # Create 14D proprioception vector: [joint_q, joint_dq]
+                        proprioception = np.concatenate([joint_q, joint_dq]).astype(np.float32)
+                        
+                        print(f"Proprioception shape: {proprioception.shape}")
+                        print(f"Joint positions: {joint_q}")
+                        print(f"Joint velocities: {joint_dq}")
+                    else:
+                        # Fallback to zeros if state unavailable
+                        proprioception = np.zeros(14, dtype=np.float32)
+                        print("Warning: Robot state unavailable, using zero proprioception")
+
                     action = policy.predict_action(
-                        None,
+                        proprioception[None, ...] if proprioception is not None else None,  # Add batch dimension
                         np.array(list(fsr_obs)).astype(np.float32)
                         if policy.model_cfg.dataset.enable_fsr
                         else None,
-                        model_input_image[None, ...],  # Use processed image
+                        obs_frame_cropped[None, ...],  # Use cropped BGR image (160×240 as (H,W,C), will be converted to RGB in real_policy.py)
                     )
+                    
+                    print("\nDEBUG: Raw Action Output")
+                    print(f"Action shape: {action.shape}")
+                    print(f"Action min/max: [{action.min():.4f}, {action.max():.4f}]")
+                    print(f"Action mean/std: [mean={action.mean():.4f}, std={action.std():.4f}]")
+                    
                     # convert to abs action
                     relative_pose = action[:, :6]
                     hand_action = action[:, 6:]
+                    
+                    print("\nDEBUG: Action Components")
+                    print(f"Relative pose (first): {relative_pose[0]}")
+                    print(f"Hand action (first): {hand_action[0][:4]}...")  # Show first 4 joints
+                    print(f"Relative pose norm: {np.linalg.norm(relative_pose[0][:3]):.4f}")  # Position magnitude
+                    print(f"Relative rotation norm: {np.linalg.norm(relative_pose[0][3:]):.4f}")  # Rotation magnitude
+                    # ============ DEBUG SECTION END ============
+                    
+                    # Convert relative poses from rotation vector to homogeneous matrices
+                    # The model outputs 6D actions: [x, y, z, rx, ry, rz] (rotation vector)
                     relative_pose = np.array(
                         [
                             vec6dof_to_homogeneous_matrix(rp[:3], rp[3:])
@@ -458,6 +465,7 @@ def main(
 
                         hand_action += offset
 
+
                     # get the robot pose when images were captured
                     robot_frames = robot_client.get_state_history()
                     robot_timestamp = []
@@ -467,24 +475,63 @@ def main(
                         # HTTP client returns 7D pose (xyz + quaternion)
                         tcp_pose = rf["state"]["ActualTCPPose"]
                         xyz = tcp_pose[:3]
-                        # Convert quaternion to rotation vector for homogeneous matrix
+                        # Convert directly from quaternion to homogeneous matrix
                         if len(tcp_pose) == 7:
-                            rotvec = st.Rotation.from_quat(tcp_pose[3:]).as_rotvec()
+                            quat = tcp_pose[3:]  # quaternion (x,y,z,w)
+                            rotation_matrix = st.Rotation.from_quat(quat).as_matrix()
                         else:
-                            rotvec = tcp_pose[3:]  # Already in rotvec format
-                        robot_homogeneous_matrix.append(
-                            vec6dof_to_homogeneous_matrix(xyz, rotvec)
-                        )
+                            # If already in rotvec format
+                            rotvec = tcp_pose[3:]
+                            rotation_matrix = st.Rotation.from_rotvec(rotvec).as_matrix()
+
+                        transform_matrix = np.eye(4)
+                        transform_matrix[:3, :3] = rotation_matrix
+                        transform_matrix[:3, 3] = xyz
+                        robot_homogeneous_matrix.append(transform_matrix)
                     robot_timestamp = np.array(robot_timestamp)
                     robot_homogeneous_matrix = np.array(robot_homogeneous_matrix)
                     
-                    # Interpolate to get pose at inference time
-                    robot_pose_interpolator = PoseInterpolator(
-                        timestamps=robot_timestamp,
-                        homogeneous_matrix=robot_homogeneous_matrix,
-                    )
-                    aligned_pose = robot_pose_interpolator([t_actual_inference])[0]
-                    ee_aligned_pose = homogeneous_matrix_to_6dof(aligned_pose)
+                    # ============ ROBOT TIMESTAMP VERIFICATION ============
+                    if len(robot_timestamp) > 0:
+                        print(f"🤖 ROBOT TIMESTAMP DEBUG:")
+                        print(f"  Latest robot timestamp: {robot_timestamp[-1]:.3f} (wall time)")
+                        print(f"  Robot timestamps range: {len(robot_timestamp)} samples")
+                        print(f"  Time gap robot->inference: {t_actual_inference - robot_timestamp[-1]:.3f}s")
+                    # ============ ROBOT TIMESTAMP VERIFICATION END ============
+                    
+                    # Handle insufficient history for interpolation
+                    if len(robot_frames) < 2:
+                        print(f"Warning: Only {len(robot_frames)} robot states in history, using current state")
+                        # Use current robot state directly
+                        current_state = robot_client.get_state()
+                        tcp_pose = current_state["state"]["ActualTCPPose"]
+                        xyz = tcp_pose[:3]
+                        if len(tcp_pose) == 7:
+                            quat = tcp_pose[3:]  # quaternion (x,y,z,w)
+                            rotation_matrix = st.Rotation.from_quat(quat).as_matrix()
+                        else:
+                            # If already in rotvec format
+                            rotvec = tcp_pose[3:]
+                            rotation_matrix = st.Rotation.from_rotvec(rotvec).as_matrix()
+
+                        aligned_pose_matrix = np.eye(4)
+                        aligned_pose_matrix[:3, :3] = rotation_matrix
+                        aligned_pose_matrix[:3, 3] = xyz
+                        aligned_pose = homogeneous_matrix_to_6dof(aligned_pose_matrix)
+                    else:
+                        # Interpolate to get pose at inference time
+                        try:
+                            robot_pose_interpolator = PoseInterpolator(
+                                timestamps=robot_timestamp,
+                                homogeneous_matrix=robot_homogeneous_matrix,
+                            )
+                            aligned_pose_matrix = robot_pose_interpolator([t_actual_inference])[0]
+                            aligned_pose = homogeneous_matrix_to_6dof(aligned_pose_matrix)
+                        except ValueError as e:
+                            print(f"Interpolation failed: {e}, using most recent state")
+                            # Fallback to most recent state
+                            aligned_pose = homogeneous_matrix_to_6dof(robot_homogeneous_matrix[-1])
+                    ee_aligned_pose = aligned_pose
                     
                     # Build current end-effector transformation matrix T_BE
                     T_BE = np.eye(4)
@@ -497,22 +544,43 @@ def main(
                     # Since we're directly in end-effector frame, just apply relative transform
                     T_BN = np.zeros_like(relative_pose)
                     for iter_idx in range(len(relative_pose)):
-                        # Direct application: T_BN = T_BE @ relative_pose
-                        T_BN[iter_idx] = T_BE @ relative_pose[iter_idx]
+                        # Fixed application: T_BN = relative_pose @ T_BE (corrected matrix order)
+                        T_BN[iter_idx] = relative_pose[iter_idx] @ T_BE
+                    
+                    # ============ DEBUG: Target Poses ============
+                    print("\nDEBUG: Target Transformation")
+                    print(f"Current EE pose: {ee_aligned_pose[:3]}")  # Current position
+                    print(f"First target pose: {T_BN[0, :3, -1]}")  # First target position
+                    print(f"Position change: {T_BN[0, :3, -1] - ee_aligned_pose[:3]}")  # Delta position
+                    # ============ DEBUG END ============
                     # discard actions which in the past
                     n_action = T_BN.shape[0]
-                    t_exec = time.monotonic()
+                    t_exec = time.time()  # Use wall clock time consistently
                     robot_scheduled = 0
                     hand_scheduled = 0
 
                     # Process robot waypoints
                     robot_times = t_actual_inference + np.arange(n_action) * dt
                     valid_robot_idx = robot_times >= t_exec + robot_action_latency + dt
-                    # convert to global time
-                    robot_times = robot_times - time.monotonic() + time.time()
+                    # robot_times are already in wall clock time, no conversion needed
+                    
+                    # ============ SCHEDULING TIME VERIFICATION ============ 
+                    print(f"📅 SCHEDULING DEBUG:")
+                    print(f"  Current execution time: {t_exec:.3f}")
+                    print(f"  First robot waypoint time: {robot_times[0]:.3f}")
+                    print(f"  Time until first execution: {robot_times[0] - t_exec:.3f}s")
+                    print(f"  Valid robot actions: {np.sum(valid_robot_idx)}/{n_action}")
+                    # ============ SCHEDULING TIME VERIFICATION END ============
                     for k in np.where(valid_robot_idx)[0]:
                         target_pose = np.zeros(6)
                         target_pose[:3] = T_BN[k, :3, -1]
+                        
+                        # Limit z coordinate to minimum value of 0.19
+                        min_z = 0.19
+                        if target_pose[2] < min_z:
+                            print(f"Z coordinate {target_pose[2]:.4f} is below minimum {min_z}, clamping to {min_z}")
+                            target_pose[2] = min_z
+                        
                         target_pose[3:] = st.Rotation.from_matrix(
                             T_BN[k, :3, :3]
                         ).as_rotvec()
@@ -522,8 +590,7 @@ def main(
                     # Process hand waypoints
                     hand_times = t_actual_inference + np.arange(n_action) * dt
                     valid_hand_idx = hand_times >= t_exec + hand_action_latency + dt
-                    # convert to global time
-                    hand_times = hand_times - time.monotonic() + time.time()
+                    # hand_times are already in wall clock time, no conversion needed
                     for k in np.where(valid_hand_idx)[0]:
                         target_hand_action = hand_action[k]
                         dexhand_client.schedule_waypoint(
@@ -534,7 +601,38 @@ def main(
                     print(
                         f"Scheduled actions: {robot_scheduled} robot waypoints, {hand_scheduled} hand waypoints"
                     )
-                    virtual_hand_pos = hand_action[exec_horizon + 1]
+                    if len(hand_action) > exec_horizon + 1:
+                        virtual_hand_pos = hand_action[exec_horizon + 1]
+                    else:
+                        virtual_hand_pos = hand_action[-1]
+        
+        # Session completed, reset to initial positions
+        print("20-second session completed. Resetting to initial positions...")
+        
+        # Stop video recording thread
+        video_recording_active.clear()
+        video_thread.join(timeout=2)  # Wait up to 2 seconds for thread to finish
+        
+        # Save video offline (does not affect real-time performance)
+        video_save_dir = "/home/ubuntu/hgw/IL/DexUMI/data/video"
+        save_video_offline(video_frames, video_timestamps, video_save_dir, session_start_time)
+        
+        # Reset robot to initial position
+        initial_pose_6d = np.zeros(6)
+        initial_pose_6d[:3] = initial_robot_pose[:3]
+        initial_pose_6d[3:] = st.Rotation.from_quat(initial_robot_pose[3:]).as_rotvec()
+        robot_client.schedule_waypoint(initial_pose_6d, time.time())
+        
+        # Reset hand to initial position
+        for _ in range(3):
+            dexhand_client.schedule_waypoint(
+                target_pos=initial_hand_pos,
+                target_time=time.time() + 0.05,
+            )
+            time.sleep(1)
+        
+        print("Reset completed. Ready for next session.")
+        time.sleep(2)
 
 
 if __name__ == "__main__":

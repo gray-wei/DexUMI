@@ -127,6 +127,8 @@ python linkage_optimization/get_equivalent_thumb.py -r /path/to/sim -b /path/to/
 
 **Multi-Modal Data Handling**: Vision, proprioception, and force data are processed separately then concatenated for policy conditioning. Missing modalities are handled gracefully.
 
+**Direct Proprioceptive Training**: The system supports direct training on robot proprioceptive data without complex preprocessing. This approach bypasses exoskeleton-to-robot data conversion, avoiding interpolation errors and maintaining data integrity. Robot joint angles, positions, and force readings are fed directly into the network model for training.
+
 **Distributed Training**: Uses Accelerate for multi-GPU training with NCCL backend. Training supports gradient accumulation and EMA model updates.
 
 **Real-Time Control**: Policy evaluation runs in real-time with 30Hz control loop, requiring careful attention to inference latency and action smoothing.
